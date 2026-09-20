@@ -1,0 +1,17 @@
+{
+  "host": "192.168.2.3",
+  "port": 3883,
+  "subnet": "192.168.2.0/24",
+  "transport": "udp",
+  "local_ip": "",
+  "object_name": "",
+  "sensor_id": null,
+  "units": "m",
+  "print_format": "pretty",
+  "print_rate_hz": 10,
+  "csv_path": "",
+  "connect_timeout_s": 3.0,
+  "data_timeout_s": 0.5,
+  "reconnect": false,
+  "reconnect_delay_s": 2.0
+}
