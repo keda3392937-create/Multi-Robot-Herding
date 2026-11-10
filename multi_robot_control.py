@@ -18,8 +18,9 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 
-DEFAULT_IDS = ( 1,2, 3, 4, 5, 6, 8, 10, 12, 13, 15)
-NETWORK = ipaddress.ip_network("192.168.30.0/24")
+DEFAULT_IDS = tuple(range(1, 51))
+# YAYA LAN; discovery binding, broadcasts and diagnostics share this setting.
+NETWORK = ipaddress.ip_network("192.168.33.0/24")
 DISCOVERY_PORT = 4210
 CONTROL_PORT = 23
 DISCOVERY_REQUEST = b"BOID_CAR_DISCOVER"
@@ -57,7 +58,10 @@ def discover_fixed(ids: Sequence[int], timeout: float, bind_ips: Iterable[str] =
     """Discover all requested IDs in one quiet UDP pass."""
     local_ips = local_yaya_ips(bind_ips)
     if not local_ips:
-        raise RuntimeError("No local 192.168.30.x address; connect the computer to YAYA first.")
+        raise RuntimeError(
+            f"No local IPv4 address on {NETWORK}; connect the computer to YAYA first."
+        )
+    broadcast_ip = str(NETWORK.broadcast_address)
     sockets = []
     found: Dict[int, Tuple[str, int]] = {}
     try:
@@ -75,7 +79,7 @@ def discover_fixed(ids: Sequence[int], timeout: float, bind_ips: Iterable[str] =
             if now >= next_send:
                 for sock in sockets:
                     try:
-                        sock.sendto(DISCOVERY_REQUEST, ("192.168.30.255", DISCOVERY_PORT))
+                        sock.sendto(DISCOVERY_REQUEST, (broadcast_ip, DISCOVERY_PORT))
                     except OSError:
                         pass
                 next_send = now + 0.3

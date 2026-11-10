@@ -211,7 +211,7 @@ def local_ipv4_candidates() -> Tuple[str, ...]:
 
 
 def default_broadcast_targets(bind_ips: Iterable[str]) -> Tuple[str, ...]:
-    targets = {"255.255.255.255", "192.168.30.255"}
+    targets = {"255.255.255.255", "192.168.33.255"}
     for ip_text in bind_ips:
         parts = ip_text.split(".")
         if len(parts) == 4:

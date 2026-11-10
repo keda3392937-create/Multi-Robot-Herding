@@ -19,13 +19,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 def connect_car(car_id: int, args: argparse.Namespace) -> CarConnection:
-    bind_ips = tuple(args.bind_ip) or tuple(ip for ip in local_ipv4_candidates() if ip.startswith("192.168.30."))
+    bind_ips = tuple(args.bind_ip) or tuple(ip for ip in local_ipv4_candidates() if ip.startswith("192.168.33."))
     if not bind_ips:
-        raise RuntimeError("No local 192.168.30.x address. Connect the computer to YAYA first.")
+        raise RuntimeError("No local 192.168.33.x address. Connect the computer to YAYA first.")
     last_error = None
     for attempt in range(args.discovery_retries + 1):
         try:
-            ip, port = discover_car(car_id, args.discovery_timeout, bind_ips=bind_ips, broadcast_ips=("192.168.30.255",))
+            ip, port = discover_car(car_id, args.discovery_timeout, bind_ips=bind_ips, broadcast_ips=("192.168.33.255",))
             connection = CarConnection.connect(car_id, ip, port, discovered_endpoint=(car_id, ip, port))
             connection.set_speed(args.speed)
             connection.stop()

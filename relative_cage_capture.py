@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import median
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 VICON_SDK_PATH = Path(r"D:\ViconDataStream\Win64\Python\vicon_dssdk")
@@ -45,7 +45,7 @@ from relative_cage_core import (
 from six_car_repel import connect_wifi, discover_car_ips
 
 
-DEFAULT_VICON_HOST = "192.168.30.100"
+DEFAULT_VICON_HOST = "192.168.33.102"
 DEFAULT_WIFI_SSID = "YAYA"
 CONTROL_PORT = 23
 MOTION_COMMANDS = ("F", "RF", "RB", "B", "LB", "LF")
@@ -391,7 +391,7 @@ def format_ids(ids: Iterable[int]) -> str:
     return ",".join(str(marker_id) for marker_id in values) if values else "none"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None, defaults=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Baseline-inspired real-car herding with a Vicon-defined relative field and an "
@@ -434,6 +434,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ping-interval", type=float, default=1.0)
 
     parser.add_argument("--arm", action="store_true", help="Allow calibration and motor commands.")
+    parser.add_argument(
+        "--dry-run", dest="arm", action="store_false",
+        help="Only validate/read the field and do not connect to car TCP.",
+    )
     parser.add_argument("--passive-evaders", action="store_true")
     parser.add_argument("--allow-partial-vicon", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
@@ -458,13 +462,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command-switch-margin", type=float, default=0.08)
 
     parser.add_argument("--calibration-file", type=Path, default=Path("relative_cage_calibration.json"))
-    parser.add_argument("--recalibrate", action="store_true")
+    parser.add_argument(
+        "--recalibrate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ignore the stored calibration file and measure every car again.",
+    )
     parser.add_argument("--calibration-tag", default="default")
     parser.add_argument("--calibration-max-age-hours", type=float, default=24.0)
     parser.add_argument("--calibration-speed", type=int, default=110)
     parser.add_argument("--calibration-move-sec", type=float, default=0.30)
     parser.add_argument("--calibration-settle-sec", type=float, default=0.30)
     parser.add_argument("--calibration-samples", type=int, default=4)
+    parser.add_argument(
+        "--parallel-calibration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Calibrate all pending cars together one direction at a time (default: enabled).",
+    )
     parser.add_argument("--min-calibration-displacement-ratio", type=float, default=0.006)
     parser.add_argument("--max-calibration-displacement-ratio", type=float, default=0.12)
     parser.add_argument("--calibration-clearance-ratio", type=float, default=0.06)
@@ -475,7 +490,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--log-root", type=Path, default=Path("relative_cage_runs"))
     parser.add_argument("--no-log", action="store_true")
-    args = parser.parse_args()
+    if defaults:
+        parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
 
     if args.pwm_slew_per_cycle is not None:
         args.pwm_slew_per_sec = args.pwm_slew_per_cycle / max(args.control_period, 1e-9)
@@ -724,7 +741,7 @@ def collect_initial_visibility(
 
 
 def print_arena(arena: RelativeArena, corners: FieldCorners) -> None:
-    print("Relative field initialized from Vicon subjects:")
+    print("Field coordinates (world / local):")
     for name, position in corners.as_dict().items():
         local = arena.world_to_local(position)
         print(
@@ -1013,7 +1030,7 @@ def calibrate_one_car(
             latest_poses,
             arena,
             start_clearance,
-            start_separation,
+            0.0,
         )
         if not safe:
             print(f"  {command}: skipped because calibration position is unsafe ({reason})")
@@ -1093,7 +1110,7 @@ def calibrate_one_car(
                 latest_poses,
                 arena,
                 online_clearance,
-                online_separation,
+                0.0,
             )
             if not safe:
                 abort_reason = reason
@@ -1158,7 +1175,7 @@ def calibrate_one_car(
                 latest_poses,
                 arena,
                 online_clearance,
-                online_separation,
+                0.0,
             )
             if not safe:
                 settle_abort_reason = reason
@@ -1596,6 +1613,9 @@ def prepare_calibrations(
     arena: RelativeArena,
     args: argparse.Namespace,
     logger: "ExperimentLogger",
+    calibrator: Optional[Callable[..., Tuple[
+        Dict[int, Dict[str, MotionCalibration]], Dict[int, str],
+    ]]] = None,
 ) -> Tuple[Dict[int, Dict[str, MotionCalibration]], Dict[int, str]]:
     loaded = (
         {}
@@ -1609,6 +1629,8 @@ def prepare_calibrations(
     )
     result: Dict[int, Dict[str, MotionCalibration]] = {}
     excluded: Dict[int, str] = {}
+
+    pending: List[int] = []
 
     for marker_id in controlled_ids:
         controller = controllers.get(marker_id)
@@ -1628,35 +1650,48 @@ def prepare_calibrations(
             logger.event("calibration_loaded", summary, marker_id)
             continue
 
-        logger.event("calibration_started", f"subject={subjects_by_id[marker_id]}", marker_id)
-        measured = calibrate_one_car(
-            marker_id,
-            subjects_by_id[marker_id],
-            controller,
-            controllers,
-            tracker,
-            subjects_by_id,
-            corner_subject_map,
-            corner_reference,
-            arena,
-            args,
-            logger,
-        )
-        measured = filtered_calibrations(measured)
-        valid, summary = valid_calibration_set(
-            measured,
-            args.min_calibrated_commands,
-            args.max_calibration_angle_gap_deg,
-        )
-        if not valid:
-            excluded[marker_id] = f"calibration rejected: {summary}"
-            print(f"Ignoring car{marker_id}: {excluded[marker_id]}")
-            logger.event("calibration_rejected", excluded[marker_id], marker_id)
-            controller.send_stop(force=True)
-            continue
-        result[marker_id] = measured
-        print(f"Accepted car{marker_id} calibration: {summary}")
-        logger.event("calibration_accepted", summary, marker_id)
+        pending.append(marker_id)
+
+    if pending:
+        measured_by_id: Dict[int, Dict[str, MotionCalibration]] = {}
+        runtime_excluded: Dict[int, str] = {}
+        if calibrator is not None:
+            measured_by_id, runtime_excluded = calibrator(
+                pending, controllers, tracker, subjects_by_id, arena, args, logger,
+            )
+        elif args.parallel_calibration:
+            measured_by_id, runtime_excluded = calibrate_cars_in_parallel(
+                pending, controllers, tracker, subjects_by_id, arena, args, logger,
+            )
+        else:
+            for marker_id in pending:
+                logger.event(
+                    "calibration_started",
+                    f"subject={subjects_by_id[marker_id]}",
+                    marker_id,
+                )
+                measured_by_id[marker_id] = calibrate_one_car(
+                    marker_id, subjects_by_id[marker_id], controllers[marker_id],
+                    controllers, tracker, subjects_by_id, corner_subject_map,
+                    corner_reference, arena, args, logger,
+                )
+        for marker_id, reason in sorted(runtime_excluded.items()):
+            excluded[marker_id] = reason
+            print(f"Ignoring car{marker_id}: {reason}")
+            logger.event("calibration_rejected", reason, marker_id)
+        for marker_id, measured in measured_by_id.items():
+            measured = filtered_calibrations(measured)
+            valid, summary = valid_calibration_set(
+                measured, args.min_calibrated_commands, args.max_calibration_angle_gap_deg,
+            )
+            if valid:
+                result[marker_id] = measured
+                print(f"Accepted car{marker_id}: {summary}")
+                logger.event("calibration_accepted", summary, marker_id)
+            else:
+                excluded[marker_id] = f"calibration rejected: {summary}"
+                print(f"Ignoring car{marker_id}: {excluded[marker_id]}")
+                logger.event("calibration_rejected", excluded[marker_id], marker_id)
 
     if result:
         saved = dict(loaded)
@@ -1664,6 +1699,159 @@ def prepare_calibrations(
         save_calibration_file(args.calibration_file, saved, subjects_by_id, args.calibration_tag)
         print(f"Calibration saved to {args.calibration_file.resolve()}")
     return result, excluded
+
+
+def _sample_subject_poses(
+    tracker: ViconSubjectTracker,
+    subjects_by_id: Mapping[int, str],
+    marker_ids: Sequence[int],
+    sample_count: int,
+    timeout_sec: float,
+) -> Dict[int, WorldPose]:
+    """Collect all requested poses in one Vicon sampling window."""
+    samples: Dict[int, List[WorldPose]] = {marker_id: [] for marker_id in marker_ids}
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline and any(len(values) < sample_count for values in samples.values()):
+        snapshot = tracker.get_snapshot()
+        for marker_id in marker_ids:
+            subject_name = subjects_by_id[marker_id]
+            pose = snapshot.poses.get(subject_name)
+            if pose is not None and subject_name in snapshot.fresh_subjects and len(samples[marker_id]) < sample_count:
+                samples[marker_id].append(pose)
+        time.sleep(0.005)
+    result: Dict[int, WorldPose] = {}
+    for marker_id, values in samples.items():
+        if len(values) < sample_count:
+            continue
+        result[marker_id] = WorldPose(
+            subject_name=values[0].subject_name,
+            position=(median(p.position[0] for p in values), median(p.position[1] for p in values)),
+            yaw=median_angle([p.yaw for p in values]),
+            seen_at=max(p.seen_at for p in values),
+            frame_number=values[-1].frame_number,
+        )
+    return result
+
+
+def calibrate_cars_in_parallel(
+    marker_ids: Sequence[int],
+    controllers: Mapping[int, ExperimentCarController],
+    tracker: ViconSubjectTracker,
+    subjects_by_id: Mapping[int, str],
+    arena: RelativeArena,
+    args: argparse.Namespace,
+    logger: "ExperimentLogger",
+) -> Tuple[Dict[int, Dict[str, MotionCalibration]], Dict[int, str]]:
+    """Calibrate all pending vehicles one direction at a time.
+
+    This deliberately does not inspect inter-car separation. Calibration is a
+    short identification pulse, and the collision guard is enabled only in the
+    formal control loop. Field boundary, displacement, Vicon freshness and TCP
+    failures remain checked so a bad pulse cannot run indefinitely.
+    """
+    active = [marker_id for marker_id in marker_ids if controllers[marker_id].active]
+    results: Dict[int, Dict[str, MotionCalibration]] = {marker_id: {} for marker_id in active}
+    excluded: Dict[int, str] = {}
+    min_displacement = args.min_calibration_displacement_ratio * arena.scale_mm
+    max_displacement = args.max_calibration_displacement_ratio * arena.scale_mm
+    print(f"Parallel calibration: {len(active)} cars, one direction at a time; inter-car spacing checks disabled.")
+    for marker_id in active:
+        logger.event("calibration_started", "parallel", marker_id)
+
+    for command in MOTION_COMMANDS:
+        active = [marker_id for marker_id in active if controllers[marker_id].active]
+        if not active:
+            break
+        stop_all({marker_id: controllers[marker_id] for marker_id in active})
+        if args.calibration_settle_sec:
+            time.sleep(args.calibration_settle_sec)
+        starts = _sample_subject_poses(
+            tracker, subjects_by_id, active, args.calibration_samples, 2.0,
+        )
+        for marker_id in tuple(active):
+            if marker_id not in starts:
+                excluded.setdefault(marker_id, "parallel calibration: no fresh start pose")
+                controllers[marker_id].send_stop(force=True)
+                controllers[marker_id].close(send_stop=False)
+        active = [marker_id for marker_id in active if marker_id in starts]
+        if not active:
+            continue
+        print(f"  Parallel {command}: moving {len(active)} cars")
+        move_started = time.monotonic()
+        deadline = move_started + args.calibration_move_sec
+        pulse_ends = dict(starts)
+        failures: Dict[int, str] = {}
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            for marker_id in tuple(active):
+                controller = controllers[marker_id]
+                if not controller.set_motion(command, args.calibration_speed, now, 0.10):
+                    failures[marker_id] = controller.failure_reason or "TCP command failed"
+                    active.remove(marker_id)
+            snapshot = tracker.get_snapshot()
+            for marker_id in tuple(active):
+                pose = snapshot.poses.get(subjects_by_id[marker_id])
+                if pose is None:
+                    continue
+                pulse_ends[marker_id] = pose
+                if not arena.contains_field_world(
+                    pose.position, 0.5 * args.robot_diameter_mm
+                ):
+                    failures[marker_id] = "calibration pulse reached virtual field boundary"
+                    controllers[marker_id].send_stop(force=True)
+                    controllers[marker_id].close(send_stop=False)
+                    active.remove(marker_id)
+                    continue
+                displacement = vec_norm(vec_sub(pose.position, starts[marker_id].position))
+                if displacement > max_displacement:
+                    failures[marker_id] = f"live displacement {displacement:.1f}mm exceeded {max_displacement:.1f}mm"
+                    controllers[marker_id].send_stop(force=True)
+                    controllers[marker_id].close(send_stop=False)
+                    active.remove(marker_id)
+            time.sleep(0.01)
+        stop_all({marker_id: controllers[marker_id] for marker_id in marker_ids if controllers[marker_id].active})
+        if args.calibration_settle_sec:
+            time.sleep(args.calibration_settle_sec)
+        ends = _sample_subject_poses(
+            tracker, subjects_by_id, active, args.calibration_samples, 2.0,
+        )
+        for marker_id, reason in failures.items():
+            excluded.setdefault(marker_id, f"parallel calibration failed: {reason}")
+            controllers[marker_id].close(send_stop=False)
+        for marker_id in active:
+            start = starts.get(marker_id)
+            end = ends.get(marker_id)
+            pulse_end = pulse_ends.get(marker_id, end)
+            if start is None or end is None or pulse_end is None:
+                excluded.setdefault(marker_id, "parallel calibration: no fresh end pose")
+                continue
+            displacement = vec_sub(end.position, start.position)
+            powered = vec_sub(pulse_end.position, start.position)
+            distance = vec_norm(displacement)
+            powered_distance = vec_norm(powered)
+            yaw_change_deg = abs(math.degrees(angle_wrap(end.yaw - start.yaw)))
+            duration = max(pulse_end.seen_at - start.seen_at, 1e-6)
+            warning = ""
+            if powered_distance < min_displacement:
+                warning = f"too little displacement (<{min_displacement:.1f}mm)"
+            elif distance > max_displacement:
+                warning = f"unrealistic displacement (>{max_displacement:.1f}mm)"
+            elif yaw_change_deg > args.max_calibration_yaw_change_deg:
+                warning = f"yaw changed {yaw_change_deg:.1f}deg"
+            if warning:
+                logger.event("calibration_direction_rejected", f"{command}: {warning}", marker_id)
+                continue
+            results[marker_id][command] = MotionCalibration(
+                direction_world=vec_normalize(powered), yaw=start.yaw,
+                displacement_mm=powered_distance,
+                measured_speed_mm_s=powered_distance / duration,
+                calibration_pwm=args.calibration_speed,
+                calibrated_at_unix=time.time(),
+            )
+            logger.event("calibration_direction_accepted", command, marker_id)
+
+    stop_all({marker_id: controllers[marker_id] for marker_id in marker_ids if controllers[marker_id].active})
+    return results, excluded
 
 
 def check_corner_reference(
@@ -1848,7 +2036,14 @@ def run_control_loop(
     calibrations: Dict[int, Dict[str, MotionCalibration]],
     ignored_ids: Set[int],
     logger: ExperimentLogger,
+    control_step=compute_control_step,
+    decision_filter=None,
 ) -> None:
+    def reset_model(marker_id):
+        dynamics.reset(marker_id)
+        if hasattr(control_step, "reset"):
+            control_step.reset(marker_id)
+
     active_herders = list(initial_herders)
     active_evaders = list(initial_evaders)
     dynamics = SecondOrderDynamics(args.seed)
@@ -1864,6 +2059,33 @@ def run_control_loop(
     last_status_at = 0.0
     last_pause_reason = ""
     motion_waiting_since: Dict[int, float] = {}
+    isolate_failures = getattr(args, "isolate_car_failures", False)
+
+    def exclude_car(marker_id, reason):
+        if marker_id not in active_herders and marker_id not in active_evaders:
+            return
+        print(f"Ignoring car{marker_id} for the rest of this run: {reason}")
+        logger.event("car_removed", reason, marker_id)
+        controller = controllers.get(marker_id)
+        if controller is not None:
+            controller.close(send_stop=True)
+        reset_model(marker_id)
+        velocity_estimator.reset(marker_id)
+        motion_waiting_since.pop(marker_id, None)
+        calibrations.pop(marker_id, None)
+        controlled_ids.discard(marker_id)
+        ignored_ids.add(marker_id)
+        if marker_id in active_herders:
+            active_herders.remove(marker_id)
+        if marker_id in active_evaders:
+            active_evaders.remove(marker_id)
+        capture_monitor.reset()
+
+    def require_active_roles():
+        if len(active_herders) < 3:
+            raise SafetyStop("fewer than 3 active herders remain after a car failure")
+        if not active_evaders:
+            raise SafetyStop("no active evaders remain after a car failure")
     print(
         "Control armed. "
         f"Herders={format_ids(active_herders)} Evaders={format_ids(active_evaders)} "
@@ -1882,6 +2104,9 @@ def run_control_loop(
         previous_loop_at = loop_started
         snapshot = tracker.get_snapshot()
 
+        if decision_filter is not None and time.monotonic() - snapshot.received_at > MAX_SAFE_CONTROL_PERIOD_SEC:
+            raise SafetyStop("Vicon frame acquisition exceeded collision prediction timing budget")
+
         corners_ok, corner_reason = check_corner_reference(
             snapshot,
             corner_subject_map,
@@ -1891,7 +2116,7 @@ def run_control_loop(
         if not corners_ok:
             stop_all(controllers)
             for marker_id in controlled_ids:
-                dynamics.reset(marker_id)
+                reset_model(marker_id)
             velocity_estimator.reset_many(controlled_ids)
             capture_monitor.reset()
             motion_waiting_since.clear()
@@ -1912,16 +2137,22 @@ def run_control_loop(
         active_ids = tuple(active_herders + active_evaders)
         missing_active = [marker_id for marker_id in active_ids if marker_id not in local_observations]
         for marker_id in missing_active:
-            dynamics.reset(marker_id)
+            reset_model(marker_id)
             velocity_estimator.reset(marker_id)
             motion_waiting_since.pop(marker_id, None)
             controller = controllers.get(marker_id)
             if controller is not None and marker_id in controlled_ids:
                 controller.send_stop(force=True)
+        if isolate_failures and missing_active and len(missing_active) < len(active_ids):
+            for marker_id in missing_active:
+                exclude_car(marker_id, "Vicon pose expired; excluded from active roles")
+            require_active_roles()
+            active_ids = tuple(active_herders + active_evaders)
+            missing_active = []
         if missing_active and not args.allow_partial_vicon:
             stop_all(controllers)
             for marker_id in controlled_ids:
-                dynamics.reset(marker_id)
+                reset_model(marker_id)
             velocity_estimator.reset_many(controlled_ids)
             capture_monitor.reset()
             motion_waiting_since.clear()
@@ -1937,7 +2168,7 @@ def run_control_loop(
         if len(visible_herders) < 3:
             stop_all(controllers)
             for marker_id in controlled_ids:
-                dynamics.reset(marker_id)
+                reset_model(marker_id)
             velocity_estimator.reset_many(controlled_ids)
             capture_monitor.reset()
             motion_waiting_since.clear()
@@ -2000,7 +2231,7 @@ def run_control_loop(
             dynamics.observe_velocity(marker_id, measured_velocity, limits)
 
         visible_obstacles = [marker_id for marker_id in ignored_ids if marker_id in local_observations]
-        result = compute_control_step(
+        result = control_step(
             local_observations,
             active_herders,
             active_evaders,
@@ -2078,6 +2309,25 @@ def run_control_loop(
                     dt,
                 )
             decisions[marker_id] = decision
+
+        # Filter the complete, quantized command batch before sending any motion.
+        if decision_filter is not None:
+            requested_decisions = dict(decisions)
+            decisions = decision_filter(
+                decisions, local_observations, world_poses, calibrations,
+                arena, params, measured_velocities, active_herders, loop_started,
+            )
+            for marker_id, decision in decisions.items():
+                if decision.command == "STOP":
+                    dynamics.reset(marker_id)
+                    if requested_decisions[marker_id].command != "STOP":
+                        reset_model(marker_id)
+
+        for marker_id, decision in decisions.items():
+            controller = controllers[marker_id]
+            if decision_filter is not None and time.monotonic() - loop_started > MAX_SAFE_CONTROL_PERIOD_SEC:
+                stop_all(controllers)
+                raise SafetyStop("Control batch too old; refusing to send stale motion")
             if not controller.set_motion(
                 decision.command,
                 decision.pwm,
@@ -2123,7 +2373,7 @@ def run_control_loop(
             failed_ids.append(ping_id)
 
         unique_failed_ids = sorted(set(failed_ids))
-        if unique_failed_ids:
+        if unique_failed_ids and not isolate_failures:
             stop_all(controllers)
         for marker_id in unique_failed_ids:
             if marker_id not in active_herders and marker_id not in active_evaders:
@@ -2134,32 +2384,16 @@ def run_control_loop(
                 if failed_controller is not None and failed_controller.failure_reason
                 else "TCP controller became inactive"
             )
-            print(f"Ignoring car{marker_id} for the rest of this run: {reason}")
-            logger.event("car_removed", reason, marker_id)
-            if failed_controller is not None:
-                failed_controller.close(send_stop=False)
-            dynamics.reset(marker_id)
-            velocity_estimator.reset(marker_id)
-            motion_waiting_since.pop(marker_id, None)
-            calibrations.pop(marker_id, None)
-            controlled_ids.discard(marker_id)
-            ignored_ids.add(marker_id)
-            if marker_id in active_herders:
-                active_herders.remove(marker_id)
-            if marker_id in active_evaders:
-                active_evaders.remove(marker_id)
-            capture_monitor.reset()
+            exclude_car(marker_id, reason)
 
-        if len(active_herders) < 3:
-            raise SafetyStop("fewer than 3 active herders remain after a controller failure")
-        if not active_evaders:
-            raise SafetyStop("no active evaders remain after a controller failure")
+        require_active_roles()
 
         if unique_failed_ids:
-            for marker_id in controlled_ids:
-                dynamics.reset(marker_id)
-            velocity_estimator.reset_many(controlled_ids)
-            motion_waiting_since.clear()
+            if not isolate_failures:
+                for marker_id in controlled_ids:
+                    reset_model(marker_id)
+                velocity_estimator.reset_many(controlled_ids)
+                motion_waiting_since.clear()
             logger.event(
                 "topology_changed",
                 f"active herders={active_herders}; active evaders={active_evaders}",
@@ -2216,8 +2450,10 @@ def run_control_loop(
         time.sleep(max(0.0, args.control_period - elapsed))
 
 
-def main() -> int:
-    args = parse_args()
+def main(args=None, control_step=compute_control_step, decision_filter=None,
+         params_factory=ControlParameters.from_arena, extra_obstacle_ids=(),
+         arena_initializer=None, calibrator=None) -> int:
+    args = parse_args() if args is None else args
     requested_herders = parse_id_spec(args.herders)
     requested_evaders = parse_id_spec(args.evaders)
     overlap = sorted(set(requested_herders) & set(requested_evaders))
@@ -2231,10 +2467,11 @@ def main() -> int:
     requested_ids = tuple(dict.fromkeys(requested_herders + requested_evaders))
     subject_overrides = parse_overrides(args.subject, "subject", requested_ids)
     ip_overrides = parse_overrides(args.car_ip, "car-ip", requested_ids)
-    subjects_by_id = car_subjects(requested_ids, subject_overrides)
-    corner_subject_map = corner_subjects(args)
+    tracked_ids = tuple(dict.fromkeys(requested_ids + tuple(extra_obstacle_ids)))
+    subjects_by_id = car_subjects(tracked_ids, subject_overrides)
+    corner_subject_map = corner_subjects(args) if arena_initializer is None else {}
     all_subject_names = tuple(corner_subject_map.values()) + tuple(subjects_by_id.values())
-    if len(set(corner_subject_map.values())) != len(CORNER_KEYS):
+    if arena_initializer is None and len(set(corner_subject_map.values())) != len(CORNER_KEYS):
         raise ValueError("The four corner Vicon subject names must be distinct")
     if len(set(subjects_by_id.values())) != len(subjects_by_id):
         raise ValueError("Every configured car must use a distinct Vicon subject name")
@@ -2253,18 +2490,19 @@ def main() -> int:
         if not args.skip_wifi:
             connect_wifi(args.wifi_ssid, args.wifi_wait, args.wifi_password)
         tracker.connect(args.vicon_connect_timeout)
-        corners, corner_reference = sample_corner_positions(
-            tracker,
-            corner_subject_map,
-            args.corner_samples,
-            args.corner_sample_timeout,
-        )
-        arena = fit_relative_arena(
-            corners,
-            cage_width_ratio=args.cage_width_ratio,
-            cage_height_ratio=args.cage_height_ratio,
-        )
-        params = ControlParameters.from_arena(arena, 0.5 * args.robot_diameter_mm)
+        if arena_initializer is None:
+            corners, corner_reference = sample_corner_positions(
+                tracker, corner_subject_map, args.corner_samples, args.corner_sample_timeout,
+            )
+            arena = fit_relative_arena(
+                corners, cage_width_ratio=args.cage_width_ratio,
+                cage_height_ratio=args.cage_height_ratio,
+            )
+        else:
+            arena, corners, corner_reference = arena_initializer(
+                tracker, args, subjects_by_id, requested_herders, requested_evaders,
+            )
+        params = params_factory(arena, 0.5 * args.robot_diameter_mm)
         controlled_speed_limits = [params.herder_dynamics.max_speed]
         if not args.passive_evaders:
             controlled_speed_limits.append(params.evader_dynamics.max_speed)
@@ -2302,7 +2540,7 @@ def main() -> int:
             return 0
 
         logger = ExperimentLogger(args.log_root, enabled=not args.no_log)
-        logger.event("armed", "Motor commands and sequential calibration enabled")
+        logger.event("armed", "Motor commands and pulse calibration enabled")
         logger.write_metadata(
             {
                 "created_at": datetime.now().astimezone().isoformat(),
@@ -2320,6 +2558,7 @@ def main() -> int:
         network_required_ids = tuple(requested_herders)
         if not args.passive_evaders:
             network_required_ids += tuple(requested_evaders)
+        print("Virtual field formed; starting car discovery and calibration.")
         controllers, excluded = connect_requested_cars(network_required_ids, ip_overrides, args)
         for marker_id, reason in sorted(excluded.items()):
             print(f"Ignoring car{marker_id}: {reason}")
@@ -2372,6 +2611,7 @@ def main() -> int:
             arena,
             args,
             logger,
+            calibrator=calibrator,
         )
         excluded.update(calibration_excluded)
 
@@ -2417,7 +2657,7 @@ def main() -> int:
                 controller.send_stop(force=True)
                 controller.close(send_stop=False)
 
-        ignored_ids = set(requested_ids) - set(active_herders) - set(active_evaders)
+        ignored_ids = set(subjects_by_id) - set(active_herders) - set(active_evaders)
         for marker_id in ignored_ids:
             excluded.setdefault(marker_id, "not in final active role set")
 
@@ -2465,6 +2705,8 @@ def main() -> int:
             calibrations,
             ignored_ids,
             logger,
+            control_step=control_step,
+            decision_filter=decision_filter,
         )
     except KeyboardInterrupt:
         print("Interrupted. Stopping all connected cars.")

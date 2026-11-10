@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 
-DEFAULT_VICON_HOST = "192.168.30.100"
+DEFAULT_VICON_HOST = "192.168.33.102"
 DEFAULT_SDK_PATH = r"D:\ViconDataStream\Win64\Python\vicon_dssdk"
 MAX_FRAME_AGE_SEC = 0.5
 

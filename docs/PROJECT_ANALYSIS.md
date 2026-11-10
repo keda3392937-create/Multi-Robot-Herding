@@ -3,7 +3,7 @@
 ## 系统链路
 
 ```text
-Vicon DataStream (192.168.30.100)
+Vicon DataStream (192.168.33.102)
         |
         | 位置、yaw、四角刚体
         v
@@ -23,8 +23,8 @@ Vicon 世界坐标只作为输入。新脚本用 `left-up`、`left-down`、`righ
 | --- | --- |
 | `baseline.py` | 纯仿真基线；包含约 40% 场地边长的左上笼区、三笼角增广凸包和 herder/evader 动力学。 |
 | `boid.py` | 较早的 boid/predator 图形仿真，与当前实机入口解耦。 |
-| `six_car_repel.py` | 通用 Wi-Fi 配置、UDP 发现、早期 TCP/Vicon 控制和标定工具。新入口只复用其 Wi-Fi 与发现函数；默认 Vicon 地址已统一为 `192.168.30.100`。 |
-| `read_vicon.py` | 单刚体 Vicon 读取脚本，当前地址为 `192.168.30.100`。 |
+| `six_car_repel.py` | 通用 Wi-Fi 配置、UDP 发现、早期 TCP/Vicon 控制和标定工具。新入口只复用其 Wi-Fi 与发现函数；默认 Vicon 地址已统一为 `192.168.33.102`。 |
+| `read_vicon.py` | 单刚体 Vicon 读取脚本，当前地址为 `192.168.33.102`。 |
 | `read_vicon_inside_field.py` | 用四角范围筛选场内车辆的读取工具，使用旧的轴对齐边界思路。 |
 | `axis_move_calibration.py` | 单车六方向/坐标轴运动标定。 |
 | `move_car_to_vicon_targets.py` | 单车移动到 Vicon 目标点的工具。 |

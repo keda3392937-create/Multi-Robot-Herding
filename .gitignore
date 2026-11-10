@@ -15,6 +15,9 @@ relative_cage_runs/
 FZMOTION小车/coverage_runs/
 *.log
 
+# Per-run six-direction calibration caches (bound to a calibration tag, expire fast)
+*_calibration.json
+
 # Local secrets and environment files
 .env
 .env.*

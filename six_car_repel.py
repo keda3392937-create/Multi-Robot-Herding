@@ -23,7 +23,7 @@ if VICON_SDK_PATH.exists():
 from vicon_dssdk import ViconDataStream
 
 
-VICON_HOST = "192.168.30.100"
+VICON_HOST = "192.168.33.103"
 CONTROL_PORT = 23
 DISCOVERY_PORT = 4210
 DISCOVERY_REQUEST = "BOID_CAR_DISCOVER"
@@ -48,25 +48,12 @@ DEFAULT_MIN_DISPLACEMENT_MM = 30.0
 DEFAULT_TARGET_STEP_MM = 350.0
 MOTION_COMMANDS = ("F", "RF", "RB", "B", "LB", "LF")
 
-CAR_IDS = tuple(range(1, 17))
-
+# Fleet-wide identity table.  Cars 1-50 all use the same UDP/TCP protocol;
+# the firmware hardware split is documented separately.
+CAR_IDS = tuple(range(1, 51))
 CAR_CONFIGS = {
-    1: ("car1_sta", "", "kedaya1"),
-    2: ("car2_sta", "", "kedaya2"),
-    3: ("car3_sta", "", "kedaya3"),
-    4: ("car4_sta", "", "kedaya4"),
-    5: ("car5_sta", "", "kedaya5"),
-    6: ("car6_sta", "", "kedaya6"),
-    7: ("car7_sta", "", "kedaya7"),
-    8: ("car8_sta", "", "kedaya8"),
-    9: ("car9_sta", "", "kedaya9"),
-    10: ("car10_sta", "", "kedaya10"),
-    11: ("car11_sta", "", "kedaya11"),
-    12: ("car12_sta", "", "kedaya12"),
-    13: ("car13_sta", "", "kedaya13"),
-    14: ("car14_sta", "", "kedaya14"),
-    15: ("car15_sta", "", "kedaya15"),
-    16: ("car16_sta", "", "kedaya16"),
+    car_id: (f"car{car_id}_sta", "", f"kedaya{car_id}")
+    for car_id in CAR_IDS
 }
 
 
@@ -466,15 +453,16 @@ def discover_car_ips(
     return discovered
 
 
-def parse_overrides(overrides, label: str) -> Dict[int, str]:
+def parse_overrides(overrides, label: str, valid_ids=None) -> Dict[int, str]:
+    valid_ids = CAR_IDS if valid_ids is None else tuple(valid_ids)
     result: Dict[int, str] = {}
     for override in overrides:
         if "=" not in override:
             raise ValueError(f"Invalid --{label} value '{override}', expected ID=VALUE")
         marker_id_text, value = override.split("=", 1)
         marker_id = int(marker_id_text)
-        if marker_id not in CAR_IDS:
-            raise ValueError(f"Invalid car id {marker_id}; expected one of {CAR_IDS}")
+        if marker_id not in valid_ids:
+            raise ValueError(f"Invalid car id {marker_id}; expected one of {valid_ids}")
         result[marker_id] = value.strip()
     return result
 
@@ -667,7 +655,8 @@ def calibrate_all_cars(
     tracker: ViconTracker,
     args: argparse.Namespace,
 ) -> CalibrationMap:
-    candidate_ids = tuple(marker_id for marker_id in CAR_IDS if marker_id in controllers)
+    # Calibrate the caller's connected subset of the 50-car fleet.
+    candidate_ids = tuple(sorted(controllers))
     calibration_by_id: CalibrationMap = {marker_id: {} for marker_id in candidate_ids}
 
     print("Starting simultaneous motion calibration. Keep the area clear.")

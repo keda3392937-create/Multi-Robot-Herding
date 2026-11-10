@@ -10,8 +10,8 @@ if VICON_SDK_PATH.exists():
 from vicon_dssdk import ViconDataStream
 
 
-VICON_HOST = "192.168.30.105"  # Vicon server IP
-SUBJECT_NAME = "kedaya9"         # Rigid body / subject name in Vicon
+VICON_HOST = "192.168.33.103"  # Vicon server IP
+SUBJECT_NAME = "kedaya4"         # Rigid body / subject name in Vicon
 
 
 client = ViconDataStream.Client()

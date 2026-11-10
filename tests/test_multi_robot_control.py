@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from multi_robot_control import RobotWorker, discover_fixed, parse_discovery, parse_ids
+from multi_robot_control import RobotWorker, discover_fixed, local_yaya_ips, parse_discovery, parse_ids
 
 
 def test_parse_discovery_uses_packet_source_ip_and_port():
@@ -20,7 +20,16 @@ def test_parse_ids_deduplicates_and_validates():
         parse_ids("2,51")
 
 
-def test_discovery_is_restricted_to_requested_ids(monkeypatch):
+def test_local_yaya_ips_selects_current_lan_and_excludes_other_adapters(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_: [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, "", (ip, 0))
+        for ip in ("192.168.145.1", "192.168.33.112", "192.168.30.101", "192.168.54.1")
+    ])
+    assert local_yaya_ips() == ("192.168.33.112",)
+    assert local_yaya_ips(("192.168.33.113",)) == ("192.168.33.113",)
+
+
+def test_discovery_is_restricted_to_requested_ids_and_current_broadcast(monkeypatch):
     created = []
 
     class FakeSocket:
@@ -29,17 +38,31 @@ def test_discovery_is_restricted_to_requested_ids(monkeypatch):
             created.append(self)
         def setsockopt(self, *args): pass
         def setblocking(self, *args): pass
-        def bind(self, *args): pass
+        def bind(self, endpoint): self.bound = endpoint
         def sendto(self, payload, endpoint): self.sent.append((payload, endpoint))
-        def close(self): pass
+        def recvfrom(self, size):
+            return replies.pop(0)
+        def close(self): self.closed = True
 
+    replies = [
+        (b"BOID_CAR id=13 tcp=23", ("192.168.33.113", 4210)),
+        (b"BOID_CAR id=2 ip=192.168.30.102 tcp=23", ("192.168.33.102", 4210)),
+        (b"BOID_CAR id=3 tcp=23", ("192.168.33.103", 4210)),
+    ]
     monkeypatch.setattr(socket, "socket", lambda *args: FakeSocket())
-    monkeypatch.setattr("multi_robot_control.select.select", lambda sockets, *_: ([], [], []))
-    clock = iter([0, 0, 1])
-    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    # A zero timeout exits without sending, while still proving input validation and cleanup.
-    assert discover_fixed((2, 3), 0, bind_ips=("192.168.30.112",)) == {}
-    assert created
+    monkeypatch.setattr("multi_robot_control.select.select", lambda sockets, *_: (sockets, [], []))
+    assert discover_fixed((2, 3), 1, bind_ips=("192.168.33.112",)) == {
+        2: ("192.168.33.102", 23), 3: ("192.168.33.103", 23)}
+    assert len(created) == 1
+    assert created[0].bound == ("192.168.33.112", 0)
+    assert created[0].sent == [(b"BOID_CAR_DISCOVER", ("192.168.33.255", 4210))]
+    assert created[0].closed
+
+
+def test_no_yaya_address_reports_current_network_without_opening_sockets(monkeypatch):
+    monkeypatch.setattr(socket, "socket", lambda *_: pytest.fail("unexpected socket"))
+    with pytest.raises(RuntimeError, match=r"192\.168\.33\.0/24"):
+        discover_fixed((2, 3), 1, bind_ips=("192.168.30.112",))
 
 
 class FakeServer:

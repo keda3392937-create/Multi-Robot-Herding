@@ -19,19 +19,21 @@ from six_car_repel import (
 )
 
 
-CAR_ID = 12
+CAR_ID = 4
 DEFAULT_WIFI_SSID = "YAYA"
-DEFAULT_VICON_HOST = "192.168.30.105"
+DEFAULT_VICON_HOST = "192.168.33.103"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Quickly verify car1 TCP communication and kedaya1 Vicon tracking by "
+            "Verify the selected car (1-50) and its kedayaN Vicon tracking by "
             "sending random planar motion commands."
         )
     )
-    parser.add_argument("--car-ip", default="", help="Override car1 IP address.")
+    parser.add_argument("--car-id", type=int, choices=range(1, 51), default=CAR_ID,
+                        help="Car number, 1-50; defaults to CAR_ID near the top of this file.")
+    parser.add_argument("--car-ip", default="", help="Override the selected car's IP address.")
     parser.add_argument("--subject", default="", help="Override Vicon subject name.")
     parser.add_argument("--vicon-host", default=DEFAULT_VICON_HOST, help="Vicon server IP address.")
     parser.add_argument("--wifi-ssid", default=DEFAULT_WIFI_SSID)
@@ -48,30 +50,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status-interval", type=float, default=0.10, help="Vicon coordinate print interval.")
     parser.add_argument("--command-refresh-sec", type=float, default=0.12, help="TCP command resend interval while moving.")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for repeatable moves.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def make_car1_config(args: argparse.Namespace) -> CarConfig:
-    name, default_ip, default_subject = CAR_CONFIGS[CAR_ID]
+    car_id = args.car_id
+    if not 1 <= car_id <= 50:
+        raise ValueError("Car ID must be from 1..50.")
+    name, default_ip, default_subject = CAR_CONFIGS.get(
+        car_id, (f"car{car_id}_sta", "", f"kedaya{car_id}")
+    )
     ip = args.car_ip or default_ip
 
     if not ip and not args.skip_discovery:
         discovered = discover_car_ips(
-            (CAR_ID,),
+            (car_id,),
             args.discovery_timeout,
             bind_ips=args.bind_ip,
             broadcast_ips=args.broadcast_ip,
         )
-        ip = discovered.get(CAR_ID, "")
+        ip = discovered.get(car_id, "")
 
     if not ip:
         raise RuntimeError(
-            f"No IP for car1. Check that car1 is powered and connected to {args.wifi_ssid}, "
-            "or pass --car-ip with car1's current IP address."
+            f"No IP for car{car_id}. Check that car{car_id} is powered and connected to {args.wifi_ssid}, "
+            f"or pass --car-ip with car{car_id}'s current IP address."
         )
 
     return CarConfig(
-        marker_id=CAR_ID,
+        marker_id=car_id,
         name=name,
         ip=ip,
         subject_name=args.subject or default_subject,
@@ -81,7 +88,7 @@ def make_car1_config(args: argparse.Namespace) -> CarConfig:
 def print_position(observation: CarObservation) -> None:
     x_mm, y_mm = observation.position
     print(
-        f"Vicon kedaya1: x={x_mm:8.1f} mm y={y_mm:8.1f} mm "
+        f"Vicon kedaya{observation.marker_id}: x={x_mm:8.1f} mm y={y_mm:8.1f} mm "
         f"yaw={math.degrees(observation.yaw):+6.1f} deg"
     )
 
@@ -113,7 +120,7 @@ def main() -> None:
 
     config = make_car1_config(args)
     controller = TcpCarController(config)
-    tracker = ViconTracker(args.vicon_host, {CAR_ID: config})
+    tracker = ViconTracker(args.vicon_host, {config.marker_id: config})
     rng = random.Random(args.seed)
 
     try:
@@ -124,18 +131,18 @@ def main() -> None:
         set_speed(controller, args.speed)
         tracker.connect()
 
-        print(f"Waiting for Vicon subject car1: {config.subject_name}")
+        print(f"Waiting for Vicon subject car{config.marker_id}: {config.subject_name}")
         initial = None
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and initial is None:
-            initial = tracker.get_observations().get(CAR_ID)
+            initial = tracker.get_observations().get(config.marker_id)
             time.sleep(0.02)
         if initial is None:
             raise RuntimeError(f"No Vicon position for subject {config.subject_name}; car will not move.")
 
         print_position(initial)
         print(
-            f"Starting {args.duration:.1f}s random car1 test at PWM "
+            f"Starting {args.duration:.1f}s random car{config.marker_id} test at PWM "
             f"{max(0, min(255, args.speed))}. Keep the area clear; press Ctrl+C to stop."
         )
 
@@ -149,14 +156,14 @@ def main() -> None:
 
         while time.monotonic() < test_end:
             now = time.monotonic()
-            observation = tracker.get_observations().get(CAR_ID)
+            observation = tracker.get_observations().get(config.marker_id)
             if observation is not None:
                 latest_observation = observation
                 if now >= next_status:
                     print_position(observation)
                     next_status = now + args.status_interval
             elif now >= next_status:
-                print("Vicon kedaya1: no fresh position")
+                print(f"Vicon {config.subject_name}: no fresh position")
                 next_status = now + args.status_interval
 
             if current_command is None and now >= next_transition:
@@ -180,9 +187,9 @@ def main() -> None:
             time.sleep(0.02)
 
         controller.send("STOP", force=True)
-        print("Test complete. car1 stopped.")
+        print(f"Test complete. car{config.marker_id} stopped.")
     except KeyboardInterrupt:
-        print("Interrupted. Stopping car1...")
+        print(f"Interrupted. Stopping car{config.marker_id}...")
     finally:
         controller.close()
 
