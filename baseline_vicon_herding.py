@@ -12,6 +12,7 @@ twelve_car_3herder_chase.py 保持一致：
 CAGE_CORNERS_WORLD），不再根据初始车位自动推算。第一次使用请先加 --dry-run
 核对坐标，再正式运行。
 """
+import math
 import time
 from pathlib import Path
 from statistics import median
@@ -37,16 +38,16 @@ VICON_SERVER = VICON_HOST                # 默认 192.168.33.103
 # 笼子必须紧贴场地的一个角，它会成为局部坐标的“左上角”，
 # 两个开口（CAGE_OPENING_MM）自动开在朝向场地内部的两条边上。
 FIELD_CORNERS_WORLD = (
-    (4000.0, 1000.0),
-    (8000.0, 1000.0),
-    (8000.0, 5000.0),
-    (4000.0, 5000.0),
+    (7180.0, 3880.0),
+    (-150.0, -2670.0),
+    (7180.0, -2670.0),
+    (-150.0, 3880.0),
 )
 CAGE_CORNERS_WORLD = (
-    (4000.0, 3400.0),
-    (5600.0, 3400.0),
-    (5600.0, 5000.0),
-    (4000.0, 5000.0),
+    (-150.0, 3880.0),
+    (-150.0, 2880.0),
+    (850.0, 3880.0),
+    (850.0, 2880.0),
 )
 # 想回到“由初始车位自动确定场地”的旧模式，把下面改成 False
 USE_FIXED_ARENA = True
@@ -166,9 +167,14 @@ def calibrate_like_twelve_car(
     excluded = {}
     sampling_missed = set()
     min_displacement = args.min_calibration_displacement_ratio * arena.scale_mm
+    max_displacement = args.max_calibration_displacement_ratio * arena.scale_mm
+    # 标定开始前有一段没有读 Vicon 的空档，先排空 SDK 缓存的旧帧，
+    # 否则第一轮的“起始位姿”可能来自更早的时间点，位移被算成几米。
+    runtime.drain_vicon_frames(tracker)
     print(
         f"Six-direction calibration: {len(active)} cars, PWM {args.calibration_speed}, "
-        f"{args.calibration_move_sec:.2f}s per direction, threshold {min_displacement:.0f}mm."
+        f"{args.calibration_move_sec:.2f}s per direction, "
+        f"valid displacement {min_displacement:.0f}..{max_displacement:.0f}mm."
     )
     for marker_id in active:
         logger.event("calibration_started", "parallel_pulse", marker_id)
@@ -264,6 +270,17 @@ def calibrate_like_twelve_car(
                     f"{command}: {distance:.1f}mm", marker_id,
                 )
                 continue
+            if distance > max_displacement:
+                # 0.45 秒脉冲跑不出这个距离：这是 Vicon 换号或跳变，丢弃该方向。
+                print(
+                    f"  car{marker_id} {command}: displacement {distance:.1f}mm "
+                    f"> {max_displacement:.0f}mm, direction ignored (Vicon jump?)"
+                )
+                logger.event(
+                    "calibration_direction_rejected",
+                    f"{command}: implausible {distance:.1f}mm", marker_id,
+                )
+                continue
             results[marker_id][command] = runtime.MotionCalibration(
                 direction_world=vec_normalize(offset),
                 yaw=start.yaw,
@@ -308,6 +325,29 @@ def build_arena_initializer():
     )
 
 
+def cage_packing_warning(arena, evader_count):
+    """按碰撞过滤真正要求的最小中心距，估算笼子能否装下全部 evader。"""
+    radius = 0.5 * ROBOT_DIAMETER_MM
+    spacing = ROBOT_DIAMETER_MM + BODY_GAP_MM
+    margin = max(radius + 20.0, 0.06 * min(arena.cage_width_mm, arena.cage_height_mm))
+    usable_width = max(0.0, arena.cage_width_mm - 2.0 * margin)
+    usable_height = max(0.0, arena.cage_height_mm - 2.0 * margin)
+    usable_area = usable_width * usable_height
+    required_area = evader_count * spacing ** 2
+    if usable_area >= required_area:
+        return False
+    suggestion = 2.0 * margin + math.ceil(math.sqrt(evader_count)) * spacing
+    print(
+        f"Warning: cage {arena.cage_width_mm:.0f}x{arena.cage_height_mm:.0f}mm is tight for "
+        f"{evader_count} evaders. With the {spacing:.0f}mm minimum centre spacing the "
+        f"collision guard enforces they need about {required_area / 1e6:.2f}m^2, but only "
+        f"{usable_area / 1e6:.2f}m^2 is usable inside the hold margin. "
+        f"Expect them to jam at the entrance; use a cage of at least "
+        f"{suggestion:.0f}x{suggestion:.0f}mm or fewer evaders."
+    )
+    return True
+
+
 def main(argv=None):
     args = parse_args(argv)
     ids = runtime.parse_id_spec(args.herders) + runtime.parse_id_spec(args.evaders)
@@ -327,6 +367,9 @@ def main(argv=None):
         )
         args.field_width_mm = arena_initializer.arena.width_mm
         args.field_height_mm = arena_initializer.arena.height_mm
+        cage_packing_warning(
+            arena_initializer.arena, len(runtime.parse_id_spec(args.evaders)),
+        )
 
     model = BaselineController(SIMULATION_TIME_SCALE, BODY_GAP_MM,
                                CAGE_OPENING_MM, WALL_REPULSION_MARGIN_MM)

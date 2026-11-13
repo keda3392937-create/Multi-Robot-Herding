@@ -238,6 +238,11 @@ def test_entry_defaults_and_runtime_hooks(monkeypatch):
         called.update(kwargs)
         return 0
     monkeypatch.setattr(entry.runtime, "main", fake_main)
+    # The test must not depend on the coordinates currently configured in the entry.
+    monkeypatch.setattr(entry, "FIELD_CORNERS_WORLD", (
+        (4000.0, 1000.0), (8000.0, 1000.0), (8000.0, 5000.0), (4000.0, 5000.0)))
+    monkeypatch.setattr(entry, "CAGE_CORNERS_WORLD", (
+        (4000.0, 3400.0), (5600.0, 3400.0), (5600.0, 5000.0), (4000.0, 5000.0)))
     assert entry.main([]) == 0
     assert isinstance(called["control_step"], BaselineController)
     assert isinstance(called["decision_filter"], PhysicalCommandFilter)
@@ -254,6 +259,8 @@ def test_entry_defaults_and_runtime_hooks(monkeypatch):
 def test_invalid_field_coordinates_stop_before_any_car_moves(monkeypatch):
     import baseline_vicon_herding as entry
     monkeypatch.setattr(entry.runtime, "main", lambda *a, **k: pytest.fail("must not run"))
+    monkeypatch.setattr(entry, "FIELD_CORNERS_WORLD", (
+        (4000.0, 1000.0), (8000.0, 1000.0), (8000.0, 5000.0), (4000.0, 5000.0)))
     monkeypatch.setattr(entry, "CAGE_CORNERS_WORLD", (
         (4000.0, 2000.0), (5600.0, 2000.0), (5600.0, 3600.0), (4000.0, 3600.0)))
     assert entry.main([]) == 2
@@ -351,6 +358,8 @@ def test_runtime_excludes_failed_role_and_keeps_healthy_cars_moving(arena, monke
     monkeypatch.setattr(runtime, "current_local_observations", current)
     monkeypatch.setattr(runtime, "ViconVelocityEstimator", Estimator)
     monkeypatch.setattr(runtime, "log_control_states", lambda *_: None)
+    # Buffered-frame draining needs a real Vicon stream; this test targets the loop.
+    monkeypatch.setattr(runtime, "drain_vicon_frames", lambda *_: None)
     controllers = {i: Controller(i) for i in ids}
     calibrations = {i: calibration() for i in ids}
     ignored = set()
@@ -369,6 +378,176 @@ def test_runtime_excludes_failed_role_and_keeps_healthy_cars_moving(arena, monke
     assert any(i != failed_id and t >= 0.15 and c != "STOP" for t, i, c in motions)
     # The only whole-fleet stop is the configured end of the test run.
     assert all(i == failed_id or t >= args.max_runtime_sec for t, i in stops)
+
+
+def _run_with_speed_spikes(monkeypatch, arena, spike_cycles):
+    """Drive run_control_loop with a fake estimator that reports huge raw speeds."""
+    import relative_cage_capture as runtime
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock.now)
+    def sleep(seconds):
+        clock.now += max(seconds, 0.01)
+    monkeypatch.setattr(runtime.time, "sleep", sleep)
+    monkeypatch.setattr(runtime, "drain_vicon_frames", lambda *_: None)
+    ids = (1, 2, 3, 9)
+    obs = {i: observation(i, 700 + 650 * k, 1000) for k, i in enumerate(ids)}
+    updates = []
+
+    class Tracker:
+        def get_snapshot(self):
+            clock.now += 0.005
+            return SimpleNamespace(received_at=clock.now, frame_number=int(clock.now / 0.01))
+
+    class Estimator:
+        def __init__(self, *_):
+            self.index = len(updates)
+            updates.append(0)
+        def update(self, observations, active_ids):
+            self.index = len(updates)
+            updates.append(self.index)
+            spike = self.index in spike_cycles
+            self.raw_this_update = {
+                marker_id: ((1800.0, 0.0) if spike else (10.0, 0.0))
+                for marker_id in active_ids
+            }
+            return {marker_id: (10.0, 0.0) for marker_id in active_ids}
+        def reset(self, *_):
+            pass
+        def reset_many(self, *_):
+            pass
+
+    class Controller:
+        def __init__(self):
+            self.active, self.last_pwm, self.last_motion = True, 0, ""
+            self.pwm_slew_credit, self.failure_reason = 0.0, ""
+            self.last_ping_at = 0.0
+        def set_motion(self, *_args, **_kwargs):
+            return True
+        def send_stop(self, force=False):
+            return True
+        def close(self, send_stop=True):
+            self.active = False
+        def ping(self):
+            return True
+
+    def current(*_args):
+        return obs, {i: SimpleNamespace(position=o.position, yaw=0.0) for i, o in obs.items()}
+
+    def model(observations, herders, evaders, *_args, **_kwargs):
+        return SimpleNamespace(
+            velocities={i: (0.0, 0.0) for i in herders + evaders},
+            visible_herders=tuple(herders), visible_evaders=tuple(evaders),
+            inside_cage_evaders=(), herder_hull_ids=tuple(herders),
+            augmented_hull_herder_ids=tuple(herders), contained_evaders=(),
+        )
+    model.reset = lambda *_: None
+
+    monkeypatch.setattr(runtime, "check_corner_reference", lambda *_: (True, ""))
+    monkeypatch.setattr(runtime, "current_local_observations", current)
+    monkeypatch.setattr(runtime, "ViconVelocityEstimator", Estimator)
+    monkeypatch.setattr(runtime, "log_control_states", lambda *_: None)
+    args = runtime.parse_args([], defaults={"isolate_car_failures": True, "max_runtime_sec": 0.30})
+    controllers = {i: Controller() for i in ids}
+    runtime.run_control_loop(
+        args, Tracker(), {i: f"kedaya{i}" for i in ids}, {}, {},
+        arena, physical_parameters(arena, 150), (1, 2, 3), (9,),
+        (1, 2, 3), (9,), controllers, {i: calibration() for i in ids}, set(),
+        SimpleNamespace(event=lambda *_: None),
+        control_step=model, decision_filter=lambda decisions, *_: decisions,
+    )
+    return len(updates)
+
+
+def test_single_frame_vicon_speed_spike_does_not_stop_the_fleet(arena, monkeypatch, capsys):
+    """A stale/current frame pair looks like a jump once; that must not abort the run."""
+    cycles = _run_with_speed_spikes(monkeypatch, arena, spike_cycles={1})
+    assert cycles >= 3
+    assert "one-frame Vicon speed spike" in capsys.readouterr().out
+
+
+def test_sustained_speed_violation_still_stops_the_fleet(arena, monkeypatch):
+    import relative_cage_capture as runtime
+    with pytest.raises(runtime.SafetyStop, match="speed/jump exceeded"):
+        _run_with_speed_spikes(monkeypatch, arena, spike_cycles={1, 2, 3, 4, 5})
+
+
+def test_calibration_drops_an_implausible_vicon_jump_direction(monkeypatch, capsys):
+    """A 4 m teleport during one pulse must not become a calibration direction."""
+    import baseline_vicon_herding as entry
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(entry.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(entry.time, "sleep",
+                        lambda seconds: setattr(clock, "now", clock.now + max(seconds, 0.01)))
+    ids = (1, 18)
+    positions = {1: (1000.0, 1000.0), 18: (2000.0, 1000.0)}
+    steps = {"F": (100.0, 0.0), "RF": (50.0, 86.6), "RB": (-50.0, 86.6),
+             "B": (-100.0, 0.0), "LB": (-50.0, -86.6), "LF": (50.0, -86.6)}
+    teleported = []
+    commanded = []
+
+    class Controller:
+        def __init__(self, marker_id):
+            self.marker_id, self.active, self.failure_reason = marker_id, True, ""
+            self.last_motion, self.last_pwm, self.pwm_slew_credit = "", None, 0.0
+        def set_motion(self, command, pwm, now, refresh):
+            commanded.append((self.marker_id, command))
+            dx, dy = steps[command]
+            x, y = positions[self.marker_id]
+            positions[self.marker_id] = (x + dx * 0.05, y + dy * 0.05)
+            if self.marker_id == 18 and not teleported:
+                # Vicon relabelled the body for one frame in the middle of F.
+                positions[18] = (positions[18][0] + 4000.0, positions[18][1])
+                teleported.append(command)
+            return True
+        def send_stop(self, force=False):
+            return self.active
+        def close(self, send_stop=True):
+            self.active = False
+
+    class Tracker:
+        def get_snapshot(self):
+            return SimpleNamespace(
+                fresh_subjects={f"kedaya{i}" for i in positions},
+                poses={f"kedaya{i}": SimpleNamespace(
+                    position=position, yaw=0.0, seen_at=clock.now)
+                    for i, position in positions.items()},
+            )
+
+    class Logger:
+        def event(self, *args):
+            pass
+
+    args = SimpleNamespace(
+        min_calibration_displacement_ratio=30.0 / 4000.0,
+        calibration_speed=255, calibration_move_sec=0.45, calibration_settle_sec=0.35,
+        max_calibration_displacement_ratio=0.12,
+    )
+    controllers = {i: Controller(i) for i in ids}
+    results, excluded = entry.calibrate_like_twelve_car(
+        list(ids), controllers, Tracker(), {i: f"kedaya{i}" for i in ids},
+        SimpleNamespace(scale_mm=4000.0), args, Logger(),
+    )
+    assert teleported == ["F"]
+    assert "F" not in results[18]
+    assert set(results[18]) == set(entry.runtime.MOTION_COMMANDS) - {"F"}
+    assert set(results[1]) == set(entry.runtime.MOTION_COMMANDS)
+    assert all(value.displacement_mm <= 480.0 for value in results[18].values())
+    assert "Vicon jump?" in capsys.readouterr().out
+
+
+def test_cage_packing_warning_flags_a_cage_too_small_for_the_evaders(capsys):
+    import baseline_vicon_herding as entry
+    from baseline_virtual_arena import fixed_arena
+    field = ((0.0, 0.0), (4000.0, 0.0), (4000.0, 4000.0), (0.0, 4000.0))
+    small, _ = fixed_arena(field, ((0.0, 3000.0), (1000.0, 3000.0),
+                                   (1000.0, 4000.0), (0.0, 4000.0)), 700.0, 150.0, 80.0)
+    assert entry.cage_packing_warning(small, 17)
+    printed = capsys.readouterr().out
+    assert "tight for 17 evaders" in printed and "1340x1340mm" in printed
+    large, _ = fixed_arena(field, ((0.0, 2400.0), (1600.0, 2400.0),
+                                   (1600.0, 4000.0), (0.0, 4000.0)), 700.0, 150.0, 80.0)
+    assert not entry.cage_packing_warning(large, 17)
+    assert capsys.readouterr().out == ""
 
 
 def test_measured_zero_does_not_erase_startup_acceleration(arena):
@@ -475,6 +654,7 @@ def test_six_direction_calibration_matches_twelve_car_behaviour(monkeypatch):
     args = SimpleNamespace(
         min_calibration_displacement_ratio=30.0 / 4000.0,
         calibration_speed=255, calibration_move_sec=0.45, calibration_settle_sec=0.35,
+        max_calibration_displacement_ratio=0.12,
     )
     controllers = {i: Controller(i) for i in ids}
     logger = Logger()
@@ -515,7 +695,7 @@ def test_calibration_reports_tcp_failure_instead_of_aborting(monkeypatch):
                 self.failure_reason = "TCP send failed"
                 return False
             x, y = positions[self.marker_id]
-            positions[self.marker_id] = (x + 40.0, y)
+            positions[self.marker_id] = (x + 3.0, y)
             return True
         def send_stop(self, force=False):
             return self.active
@@ -537,6 +717,7 @@ def test_calibration_reports_tcp_failure_instead_of_aborting(monkeypatch):
     args = SimpleNamespace(
         min_calibration_displacement_ratio=30.0 / 4000.0,
         calibration_speed=255, calibration_move_sec=0.45, calibration_settle_sec=0.35,
+        max_calibration_displacement_ratio=0.12,
     )
     controllers = {i: Controller(i) for i in ids}
     results, excluded = entry.calibrate_like_twelve_car(

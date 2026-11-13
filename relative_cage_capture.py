@@ -56,6 +56,10 @@ MAX_SAFE_CONTROL_PERIOD_SEC = 0.20
 MAX_SAFE_COMMAND_REFRESH_SEC = 0.30
 MAX_SAFE_POSE_AGE_SEC = 0.30
 MAX_SAFE_TCP_IO_TIMEOUT_SEC = 0.20
+# A single Vicon frame pair can look arbitrarily fast when the SDK hands out a
+# buffered frame next to a current one. Only a speed that stays above the limit
+# for this many consecutive control cycles stops the whole fleet.
+OVERSPEED_PERSISTENCE_FRAMES = 3
 
 
 @dataclass(frozen=True)
@@ -1948,6 +1952,26 @@ class ViconVelocityEstimator:
         return measured
 
 
+def drain_vicon_frames(
+    tracker: ViconSubjectTracker,
+    duration_sec: float = 0.25,
+) -> Optional[ViconSnapshot]:
+    """Read out frames the SDK buffered while nothing was polling Vicon.
+
+    ``GetFrame`` hands buffered frames out one by one, so after a pause (car
+    calibration, result saving, a long log write) the first control cycle can
+    pair a stale frame with a current one. The position difference then looks
+    like a large speed jump even though the cars were standing still. Polling
+    for a short window leaves the client on the newest frame.
+    """
+    deadline = time.monotonic() + duration_sec
+    snapshot: Optional[ViconSnapshot] = None
+    while time.monotonic() < deadline:
+        snapshot = tracker.get_snapshot()
+        time.sleep(0.002)
+    return snapshot
+
+
 class SafetyStop(RuntimeError):
     pass
 
@@ -2058,7 +2082,9 @@ def run_control_loop(
     previous_loop_at = started_at
     last_status_at = 0.0
     last_pause_reason = ""
+    last_overspeed_note = -math.inf
     motion_waiting_since: Dict[int, float] = {}
+    overspeed_counts: Dict[int, int] = {}
     isolate_failures = getattr(args, "isolate_car_failures", False)
 
     def exclude_car(marker_id, reason):
@@ -2092,6 +2118,9 @@ def run_control_loop(
         f"Controlled={format_ids(sorted(controlled_ids))}. Press Ctrl+C to stop."
     )
     logger.event("control_started", f"herders={active_herders}; evaders={active_evaders}")
+    # Calibration leaves buffered Vicon frames behind; consume them before the
+    # first control cycle so it does not compare a stale frame with a current one.
+    drain_vicon_frames(tracker)
 
     while True:
         loop_started = time.monotonic()
@@ -2120,6 +2149,7 @@ def run_control_loop(
             velocity_estimator.reset_many(controlled_ids)
             capture_monitor.reset()
             motion_waiting_since.clear()
+            overspeed_counts.clear()
             if corner_reason.startswith("field corner moved"):
                 raise SafetyStop(corner_reason)
             if corner_reason != last_pause_reason:
@@ -2156,6 +2186,7 @@ def run_control_loop(
             velocity_estimator.reset_many(controlled_ids)
             capture_monitor.reset()
             motion_waiting_since.clear()
+            overspeed_counts.clear()
             pause_reason = "missing active Vicon car(s): " + format_ids(missing_active)
             if pause_reason != last_pause_reason:
                 print(f"Paused: {pause_reason}")
@@ -2172,6 +2203,7 @@ def run_control_loop(
             velocity_estimator.reset_many(controlled_ids)
             capture_monitor.reset()
             motion_waiting_since.clear()
+            overspeed_counts.clear()
             pause_reason = f"only {len(visible_herders)} visible herders; at least 3 are required"
             if pause_reason != last_pause_reason:
                 print(f"Paused: {pause_reason}")
@@ -2203,7 +2235,7 @@ def run_control_loop(
 
         measured_velocities = velocity_estimator.update(local_observations, active_ids)
         raw_velocities = velocity_estimator.raw_this_update
-        overspeed = []
+        suspicious: Dict[int, float] = {}
         for marker_id, raw_velocity in raw_velocities.items():
             limits = (
                 params.herder_dynamics
@@ -2212,14 +2244,37 @@ def run_control_loop(
             )
             measured_speed = vec_norm(raw_velocity)
             if measured_speed > args.actual_speed_limit_factor * limits.max_speed:
-                overspeed.append(
-                    f"ID{marker_id}:{measured_speed:.1f}>{args.actual_speed_limit_factor:.2f}x"
-                    f"{limits.max_speed:.1f}mm/s"
-                )
-                continue
-        if overspeed:
+                overspeed_counts[marker_id] = overspeed_counts.get(marker_id, 0) + 1
+                suspicious[marker_id] = measured_speed
+            else:
+                overspeed_counts.pop(marker_id, None)
+        sustained = sorted(
+            marker_id
+            for marker_id, count in overspeed_counts.items()
+            if count >= OVERSPEED_PERSISTENCE_FRAMES
+        )
+        if sustained:
             stop_all(controllers)
-            raise SafetyStop("Vicon measured speed/jump exceeded safety limit: " + ", ".join(overspeed))
+            details = []
+            for marker_id in sustained:
+                limits = (
+                    params.herder_dynamics
+                    if marker_id in active_herders
+                    else params.evader_dynamics
+                )
+                details.append(
+                    f"ID{marker_id}:{suspicious.get(marker_id, 0.0):.1f}>"
+                    f"{args.actual_speed_limit_factor:.2f}x{limits.max_speed:.1f}mm/s"
+                )
+            raise SafetyStop("Vicon measured speed/jump exceeded safety limit: " + ", ".join(details))
+        if suspicious and loop_started - last_overspeed_note >= 1.0:
+            last_overspeed_note = loop_started
+            print(
+                "Ignoring a one-frame Vicon speed spike: "
+                + ", ".join(f"ID{marker_id}:{speed:.0f}mm/s"
+                            for marker_id, speed in sorted(suspicious.items()))
+                + f" (needs {OVERSPEED_PERSISTENCE_FRAMES} cycles in a row to stop the fleet)"
+            )
         for marker_id, measured_velocity in measured_velocities.items():
             if marker_id not in controlled_ids:
                 continue
@@ -2394,6 +2449,7 @@ def run_control_loop(
                     reset_model(marker_id)
                 velocity_estimator.reset_many(controlled_ids)
                 motion_waiting_since.clear()
+                overspeed_counts.clear()
             logger.event(
                 "topology_changed",
                 f"active herders={active_herders}; active evaders={active_evaders}",
