@@ -550,28 +550,54 @@ def test_cage_packing_warning_flags_a_cage_too_small_for_the_evaders(capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_ping_retries_a_single_wifi_timeout():
+def test_ping_reassembles_a_pong_split_across_tcp_segments():
+    """The firmware writes "PONG id=" and the number separately."""
     import relative_cage_capture as runtime
-    class FlakySocket:
+    class FragmentedSocket:
         def __init__(self):
-            self.replies = [TimeoutError("timed out"), b"PONG id=7\n"]
+            self.chunks = [b"PONG id=", TimeoutError("timed out"), b"16\r\n"]
             self.sent = []
         def sendall(self, data):
             self.sent.append(data)
         def recv(self, _count):
-            reply = self.replies.pop(0)
-            if isinstance(reply, Exception):
-                raise reply
-            return reply
+            chunk = self.chunks.pop(0)
+            if isinstance(chunk, Exception):
+                raise chunk
+            return chunk
         def close(self):
             pass
-    controller = runtime.ExperimentCarController(7, "192.168.33.111", 0.6, 0.08)
-    controller.sock = FlakySocket()
+    controller = runtime.ExperimentCarController(16, "192.168.33.120", 0.6, 0.08)
+    controller.sock = FragmentedSocket()
     controller.active = True
     assert controller.ping()
     assert controller.failure_reason == ""
-    assert controller.last_ping_at > 0
-    assert controller.sock.sent.count(b"PING\n") == 2
+    assert controller.sock.sent.count(b"PING\n") == 1
+
+
+def test_ping_keeps_a_partial_line_for_the_next_call():
+    import relative_cage_capture as runtime
+    class SlowSocket:
+        def __init__(self):
+            self.chunks = [b"PONG id="]
+            self.sent = []
+        def sendall(self, data):
+            self.sent.append(data)
+        def recv(self, _count):
+            if self.chunks:
+                return self.chunks.pop(0)
+            raise TimeoutError("timed out")
+        def close(self):
+            pass
+    controller = runtime.ExperimentCarController(16, "192.168.33.120", 0.6, 0.08)
+    sock = SlowSocket()
+    controller.sock = sock
+    controller.active = True
+    assert not controller.ping(timeout_sec=0.03)
+    assert "timed out" in controller.failure_reason
+    assert bytes(controller.ping_buffer) == b"PONG id="
+    sock.chunks.append(b"16\r\n")
+    assert controller.ping()
+    assert bytes(controller.ping_buffer) == b""
 
 
 def test_ping_does_not_retry_a_wrong_identity():
@@ -579,8 +605,9 @@ def test_ping_does_not_retry_a_wrong_identity():
     class WrongCarSocket:
         def __init__(self):
             self.reads = 0
-        def sendall(self, _data):
-            pass
+            self.sent = []
+        def sendall(self, data):
+            self.sent.append(data)
         def recv(self, _count):
             self.reads += 1
             return b"PONG id=8\n"
@@ -593,6 +620,7 @@ def test_ping_does_not_retry_a_wrong_identity():
     assert not controller.ping()
     assert "identity mismatch" in controller.failure_reason
     assert sock.reads == 1
+    assert sock.sent == [b"PING\n"]
 
 
 def test_slow_vicon_frame_pauses_instead_of_aborting(arena, monkeypatch, capsys):

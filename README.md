@@ -122,8 +122,11 @@ python baseline_vicon_herding.py --dry-run
 动捕单帧跳变不会直接停车：控制开始前先读掉 SDK 里缓存的旧帧，实测速度需要连续 3 个控制周期
 超限才整组停车，单帧只打印提示；标定也会丢弃 0.45 秒内位移超过 0.12×场地短边的方向
 （例如换号、遮挡后重捕获）。Vicon 与小车共用 Wi-Fi，取帧超过 0.2 秒只暂停一个周期、
-超过 2 秒才结束；心跳 PING 每辆车最多重试 3 次，避免一次慢回复就剔除正常车辆。
+超过 2 秒才结束；心跳 PING 只发一次、读到换行为止（固件把 `PONG id=` 和编号分两段发送），
+连续 5 次没有响应才剔除车辆。
 入口还会按 230 mm 最小中心距提醒笼子是否装得下全部 evader（17 辆约需 1.34 m 见方）。
+每次实验结束会自动生成回放：运行目录下的 `trajectory.gif` 和 `trajectory.png`，
+也可以单独重画：`python animate_herding_run.py --run relative_cage_runs/baseline/<时间>`。
 若只想查看坐标而不连接小车，运行参数中加入 `--dry-run`。
 原仿真保存在 `simulation/baseline.py`；凸包、视野、密度和追逐力公式提取至
 `baseline_forces.py`，实机缩放和避碰位于 `baseline_physical.py`，场地/笼子几何和虚拟墙位于 `baseline_virtual_arena.py`。
@@ -196,6 +199,7 @@ python multi_robot_control.py --ids 2,3,7,10 --bind-ip 192.168.33.112
 | `keyboard_remote_control.py` | 日常选车遥控入口，直接运行 Python 文件 |
 | `multi_robot_control.py` | 固定编号多车长连接测试，单车故障隔离 |
 | `twelve_car_3herder_chase.py` | 可配置 herder、evader 编号的 Vicon 驱赶实验，文件名保留原名 |
+| `animate_herding_run.py` | 把一次实验记录渲染成 `trajectory.gif` 与轨迹总览图 |
 | `vicon_monitor.py` | 独立进程中的 Vicon 监视 |
 | `firmware/` | 50 辆车的独立烧录工程 |
 | `tests/` | 固件配置、遥控、Vicon 与围捕回归测试 |

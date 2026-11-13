@@ -138,10 +138,42 @@ timing budget`），一次网络抖动就会让跑到一半的围捕停掉。现
 - 超过 2 秒仍没有帧：才判定为真正中断并结束（`Vicon stopped delivering frames for 3.05s`）。
 - 指令批次因为网络慢超过 0.2 秒：停一次车、下一周期重来，不再直接结束实验。
 
-心跳 `PING` 也一样：Wi-Fi 拥塞时 80 ms 内收不到 `PONG` 很常见。现在每辆车最多重试 3 次
-（间隔 50 ms），仍失败才剔除；只有**身份不符**（`PONG id=` 与期望编号不同）会立即剔除，
-不会重试。这也解释了之前的 `Ignoring car21: TCP PING failed: timed out`：车本身是好的，
-只是回复慢了一点点——单独跑 `random_car1_vicon_test.py` 时没有 24 辆车的竞争，所以看不出问题。
+心跳 `PING` 有三个容易踩的坑，现在都处理了：
+
+1. 固件回复分两段写：`print("PONG id=")` 之后才 `println(CAR_ID)`，两个 TCP 段之间可能隔几十毫秒。
+   旧代码一超时就重发 `PING`，下一次读到的是上一轮剩下的 `16\r\n`，于是报
+   `unexpected PING response: b'16'` 并把好车剔除（现场 16、17、25 号就是这样掉的）。
+   现在改为**只发一次** `PING`，在 0.12 秒窗口内一直读到换行为止；没读完的半个响应留在
+   `ping_buffer` 里，下一次接着拼，不会被当成新回复。
+2. 单次超时不再剔除车辆：要**连续 5 次**心跳都没有响应才判为掉线（约 5 秒），
+   中间只打印一行 `Note: carXX missed a heartbeat (...)`。
+3. 连接阶段的 `PONG` 等待放宽到 0.5 秒；只有**身份不符**（`PONG id=` 与期望编号不同）
+   或连接被关闭才会立即剔除，不重试。
+
+这也解释了之前几次 `Ignoring carXX: TCP PING failed: timed out`：车本身是好的，只是回复慢了一点——
+单独跑 `random_car1_vicon_test.py` 时没有 20 多辆车的竞争，所以看不出问题。
+
+## 运行回放（GIF）
+
+每次实验结束都会自动把这次实验渲染成：
+
+- `<运行目录>/trajectory.gif`：随时间的动画，含轨迹拖尾、车头朝向、herder 凸包、
+  笼子和两个开口，标题显示当前时间、有效 herder/evader 数量和已进笼数量；
+  被剔除或断开连接的车辆画成灰色。
+- `<运行目录>/trajectory.png`：整段实验的轨迹总览，每辆车的起点（o）和终点（X）。
+
+渲染只读 `states.csv` 和 `metadata.json`，画的就是现场实际运动，不需要重跑。
+运行太长时自动等间隔抽到最多 `ANIMATION_MAX_FRAMES` 帧。想单独重画某一次：
+
+```powershell
+python animate_herding_run.py                          # 最新一次
+python animate_herding_run.py --run relative_cage_runs/baseline/20261113_142036
+python animate_herding_run.py --fps 8 --max-frames 200 --no-labels
+```
+
+依赖 matplotlib 和 Pillow；画图失败只会打印 `Trajectory animation skipped: ...`，
+不影响实验结果，也不影响车辆状态（此时车已全部停车、Vicon 已断开）。
+启动时加 `--no-log` 则不记录也不生成动画。
 
 ## 笼子容量提醒
 

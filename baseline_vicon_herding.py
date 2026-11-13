@@ -45,9 +45,9 @@ FIELD_CORNERS_WORLD = (
 )
 CAGE_CORNERS_WORLD = (
     (-150.0, 3880.0),
-    (-150.0, 2880.0),
-    (850.0, 3880.0),
-    (850.0, 2880.0),
+    (-150.0, 2380.0),
+    (1350.0, 3880.0),
+    (1350.0, 2380.0),
 )
 # 想回到“由初始车位自动确定场地”的旧模式，把下面改成 False
 USE_FIXED_ARENA = True
@@ -105,6 +105,10 @@ CALIBRATION_TAG = "baseline-real-v3-fixed-4m-150mm"
 # 每次运行都重新标定：既避免旧标定数据与当前 PWM 不匹配，也避免部分车辆在
 # 别人标定的十几秒里空闲而被固件断开 TCP（空闲 2.5 秒即断开）。
 RECALIBRATE_EVERY_RUN = True
+# 运行结束后自动把这次实验画成 GIF/轨迹图（需要 matplotlib，失败不影响实验）
+MAKE_RUN_ANIMATION = True
+ANIMATION_FPS = 10
+ANIMATION_MAX_FRAMES = 240
 
 SKIP_WIFI_SETUP = True                   # 电脑已经连好 YAYA
 CAR_IP_OVERRIDES = ()                    # 可选：("3=192.168.33.115",)
@@ -392,10 +396,30 @@ def main(argv=None):
     print("Baseline: acceleration-based variable speed; calibrated command collision checks.")
     if not args.parallel_calibration:
         print("Note: this entry always uses the twelve_car-style six-direction pulse calibration.")
-    return runtime.main(args, control_step=model, decision_filter=guard,
-                        params_factory=parameters, extra_obstacle_ids=tuple(range(1, 51)),
-                        arena_initializer=arena_initializer,
-                        calibrator=calibrate_like_twelve_car)
+    exit_code = runtime.main(args, control_step=model, decision_filter=guard,
+                             params_factory=parameters, extra_obstacle_ids=tuple(range(1, 51)),
+                             arena_initializer=arena_initializer,
+                             calibrator=calibrate_like_twelve_car)
+    if MAKE_RUN_ANIMATION:
+        render_run_animation(args)
+    return exit_code
+
+
+def render_run_animation(args) -> None:
+    """每次运行结束后把这次实验画成 GIF 和轨迹图；失败只提示，不影响实验。"""
+    run_dir = getattr(args, "experiment_run_dir", None)
+    if run_dir is None:
+        print("No experiment log (--no-log); trajectory animation skipped.")
+        return
+    try:
+        import animate_herding_run
+        paths = animate_herding_run.render_run(run_dir, fps=ANIMATION_FPS,
+                                               max_frames=ANIMATION_MAX_FRAMES)
+    except Exception as exc:  # 画图只是附加功能，绝不能因此影响实验结果
+        print(f"Trajectory animation skipped: {type(exc).__name__}: {exc}")
+        return
+    print(f"Trajectory GIF: {paths['gif']}")
+    print(f"Trajectory overview: {paths['png']}")
 
 
 if __name__ == "__main__":

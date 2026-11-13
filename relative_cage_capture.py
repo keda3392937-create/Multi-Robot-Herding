@@ -63,9 +63,11 @@ OVERSPEED_PERSISTENCE_FRAMES = 3
 # Vicon shares the access point with the cars, so a single frame can be a few
 # hundred milliseconds late. Pause that cycle; only a real outage is fatal.
 MAX_VICON_STALL_SEC = 2.0
-# One slow PONG must not drop a healthy car for the whole experiment.
-PING_ATTEMPTS = 3
-PING_RETRY_DELAY_SEC = 0.05
+# The firmware writes "PONG id=" and the number in two TCP segments. Wait for a
+# whole line, and only drop a car after several heartbeats in a row are missing.
+PING_RESPONSE_TIMEOUT_SEC = 0.12
+PING_CONNECT_TIMEOUT_SEC = 0.50
+PING_FAILURE_LIMIT = 5
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,8 @@ class ExperimentCarController:
         self.last_pwm: Optional[int] = None
         self.pwm_slew_credit = 0.0
         self.last_ping_at = 0.0
+        self.ping_buffer = bytearray()
+        self.ping_failures = 0
 
     def connect(self) -> bool:
         self.close(send_stop=False)
@@ -251,7 +255,9 @@ class ExperimentCarController:
             self.last_pwm = None
             self.pwm_slew_credit = 0.0
             self.last_ping_at = 0.0
-            if not self.send_stop(force=True) or not self.ping():
+            self.ping_buffer = bytearray()
+            self.ping_failures = 0
+            if not self.send_stop(force=True) or not self.ping(PING_CONNECT_TIMEOUT_SEC):
                 return False
             print(f"Connected car{self.marker_id} at {self.ip}:{CONTROL_PORT}")
             return self.active
@@ -303,64 +309,68 @@ class ExperimentCarController:
         self.pwm_slew_credit = 0.0
         return True
 
-    def ping(self) -> bool:
-        """Ask the car for its identity; retries transient Wi-Fi timeouts.
+    def ping(self, timeout_sec: float = PING_RESPONSE_TIMEOUT_SEC) -> bool:
+        """Ask the car for its identity and read exactly one PONG line.
 
-        With a whole fleet on one access point a single PONG can arrive a few
-        milliseconds late. Dropping the car for the rest of the run because of
-        one slow reply is far worse than asking again, so only a wrong identity
-        or a closed socket fails immediately.
+        The firmware answers with ``print("PONG id=")`` followed by
+        ``println(CAR_ID)``, so the line can arrive in two TCP segments, and on
+        a busy access point the second one may come tens of milliseconds later.
+        Bytes that are still incomplete when the window closes stay in
+        ``ping_buffer`` and are finished by the next call; they are never
+        mistaken for the reply to a new request.
         """
-        last_reason = "TCP PING failed"
-        for attempt in range(PING_ATTEMPTS):
-            if attempt:
-                time.sleep(PING_RETRY_DELAY_SEC)
-            if self.sock is None or not self.active:
-                return False
+        if self.sock is None or not self.active:
+            return False
+        # Drop complete lines left over from an earlier request before asking again.
+        if b"\n" in self.ping_buffer:
+            self.ping_buffer = bytearray(bytes(self.ping_buffer).rsplit(b"\n", 1)[1])
+        if not self._send_line("PING") or self.sock is None:
+            return False
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline and b"\n" not in self.ping_buffer:
             try:
-                if not self._send_line("PING") or self.sock is None:
-                    return False
-                response = bytearray()
-                while len(response) < 64:
-                    chunk = self.sock.recv(64 - len(response))
-                    if not chunk:
-                        raise ConnectionError("TCP peer closed during PING")
-                    response.extend(chunk)
-                    if b"\n" in response:
-                        break
-                line = bytes(response).splitlines()[0].strip().upper()
-                if line == b"PONG" and self.allow_plain_pong:
-                    pass
-                elif line.startswith(b"PONG ID="):
-                    try:
-                        response_id = int(line.removeprefix(b"PONG ID="))
-                    except ValueError as exc:
-                        raise ConnectionError(f"invalid PING identity response: {line!r}") from exc
-                    if response_id != self.marker_id:
-                        raise ConnectionError(
-                            f"PING identity mismatch: expected car{self.marker_id}, "
-                            f"received car{response_id}"
-                        )
-                else:
-                    raise ConnectionError(f"unexpected PING response: {line!r}")
-                self.last_ping_at = time.monotonic()
-                self.failure_reason = ""
-                return True
+                chunk = self.sock.recv(64)
             except TimeoutError:
-                last_reason = f"TCP PING timed out ({attempt + 1}/{PING_ATTEMPTS})"
-                self.failure_reason = last_reason
                 continue
             except OSError as exc:
                 self.failure_reason = f"TCP PING failed: {exc}"
                 self.close(send_stop=False)
                 return False
-            except ConnectionError as exc:
-                self.failure_reason = str(exc)
+            if not chunk:
+                self.failure_reason = "TCP peer closed during PING"
                 self.close(send_stop=False)
                 return False
-        self.failure_reason = last_reason
-        self.close(send_stop=False)
-        return False
+            self.ping_buffer.extend(chunk)
+        if b"\n" not in self.ping_buffer:
+            self.failure_reason = f"TCP PING timed out after {timeout_sec * 1000:.0f}ms"
+            return False
+        raw_line, _, remainder = bytes(self.ping_buffer).partition(b"\n")
+        self.ping_buffer = bytearray(remainder)
+        line = raw_line.strip().upper()
+        if line == b"PONG" and self.allow_plain_pong:
+            pass
+        elif line.startswith(b"PONG ID="):
+            try:
+                response_id = int(line.removeprefix(b"PONG ID="))
+            except ValueError:
+                self.failure_reason = f"invalid PING identity response: {line!r}"
+                self.close(send_stop=False)
+                return False
+            if response_id != self.marker_id:
+                self.failure_reason = (
+                    f"PING identity mismatch: expected car{self.marker_id}, "
+                    f"received car{response_id}"
+                )
+                self.close(send_stop=False)
+                return False
+        else:
+            self.failure_reason = f"unexpected PING response: {line!r}"
+            self.close(send_stop=False)
+            return False
+        self.last_ping_at = time.monotonic()
+        self.ping_failures = 0
+        self.failure_reason = ""
+        return True
 
     def close(self, send_stop: bool = True) -> None:
         if self.sock is not None:
@@ -375,6 +385,8 @@ class ExperimentCarController:
                 pass
         self.sock = None
         self.active = False
+        self.ping_buffer = bytearray()
+        self.ping_failures = 0
 
 
 def parse_id_spec(text: str) -> Tuple[int, ...]:
@@ -2486,7 +2498,22 @@ def run_control_loop(
             else None
         )
         if ping_id is not None and not controllers[ping_id].ping():
-            failed_ids.append(ping_id)
+            controller = controllers[ping_id]
+            controller.ping_failures += 1
+            # Do not retry this car on the very next cycle: a dead link would
+            # otherwise block the control loop for the full ping window.
+            controller.last_ping_at = time.monotonic()
+            if controller.ping_failures >= PING_FAILURE_LIMIT:
+                controller.failure_reason = (
+                    f"{controller.failure_reason} "
+                    f"({controller.ping_failures} heartbeats in a row)"
+                )
+                failed_ids.append(ping_id)
+            elif controller.ping_failures == 1:
+                print(
+                    f"Note: car{ping_id} missed a heartbeat ({controller.failure_reason}); "
+                    f"keeping it until {PING_FAILURE_LIMIT} in a row fail."
+                )
 
         unique_failed_ids = sorted(set(failed_ids))
         if unique_failed_ids and not isolate_failures:
@@ -2657,6 +2684,8 @@ def main(args=None, control_step=compute_control_step, decision_filter=None,
             return 0
 
         logger = ExperimentLogger(args.log_root, enabled=not args.no_log)
+        # Let the caller (experiment entry) find the recorded run afterwards.
+        args.experiment_run_dir = logger.run_dir
         logger.event("armed", "Motor commands and pulse calibration enabled")
         logger.write_metadata(
             {
