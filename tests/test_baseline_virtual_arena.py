@@ -79,6 +79,34 @@ def test_herder_inside_target_can_leave_and_cannot_go_deeper():
     assert not herder_cage_path_allowed((1800, 3200), (1400, 3200), arena, 115)
 
 
+def test_membrane_cage_pushes_inside_evaders_in_and_herders_out():
+    """No openings: an evader inside is pushed back, a herder is kept outside."""
+    arena = arena_fixture()
+    params = physical_parameters(arena, 75)
+    model = BaselineController(cage_membrane_mm=250.0)
+    # Evader 50 mm inside the cage bottom wall (cage is x=[0,2500], y=[2500,5000]).
+    inside = model({1: LocalObservation(1, (800, 2550), 0, 0)}, (), (1,), (),
+                   arena, params, SecondOrderDynamics(), 0.05)
+    assert inside.accelerations[1][1] > 0
+    # Herder 50 mm below the same wall is pushed away from the cage.
+    outside = model({18: LocalObservation(18, (800, 2450), 0, 0)}, (18,), (), (),
+                    arena, params, SecondOrderDynamics(), 0.05)
+    assert outside.accelerations[18][1] < 0
+
+
+def test_membrane_guard_is_one_way():
+    arena = arena_fixture()
+    guard = PhysicalCommandFilter(cage_membrane_mm=250.0)
+    guard.herder_ids = {18}
+    # An evader inside may not cross the boundary outwards ...
+    assert not guard.safe_velocity(1, (0, -600), {1: (800, 2600)}, {}, {}, arena, 75)
+    # ... but can move freely inside, and an outside evader can be pushed in.
+    assert guard.safe_velocity(1, (0, 200), {1: (800, 2600)}, {}, {}, arena, 75)
+    assert guard.safe_velocity(1, (0, 200), {1: (800, 2300)}, {}, {}, arena, 75)
+    # Herders may never enter the cage.
+    assert not herder_cage_path_allowed((800, 2350), (800, 2700), arena, 115)
+
+
 def test_controller_repels_herder_from_virtual_field_boundary():
     arena = arena_fixture()
     params = physical_parameters(arena, 75)
@@ -165,6 +193,68 @@ def test_initial_sampling_skips_missing_car_and_freezes_geometry(monkeypatch):
     assert 25 not in args.virtual_field_initial_positions
     assert args.virtual_field_initial_positions[1] == (0, 0)
     assert arena.contains_field_world(poses[1], 300)
+
+
+def test_membrane_cage_captures_without_any_opening():
+    """The one-way soft boundary must let herders push an evader in, then hold it."""
+    import relative_cage_capture as runtime
+    from relative_cage_core import CaptureMonitor
+    arena = arena_fixture()
+    params = physical_parameters(arena, 75)
+    positions = {18: (2700., 3200.), 19: (2700., 2700.), 20: (2700., 3700.), 1: (2100., 3200.)}
+    velocities = {i: (0, 0) for i in positions}
+    controllers = {i: SimpleNamespace(last_motion="", last_pwm=None, pwm_slew_credit=0.) for i in positions}
+    directions = {c: (math.cos(k * math.pi / 3), math.sin(k * math.pi / 3))
+                  for k, c in enumerate(("F", "RF", "RB", "B", "LB", "LF"))}
+    cal = {c: SimpleNamespace(direction_world=v, yaw=0., measured_speed_mm_s=120., calibration_pwm=110)
+           for c, v in directions.items()}
+    model = BaselineController(cage_membrane_mm=250.0)
+    guard = PhysicalCommandFilter(cage_membrane_mm=250.0, isolate_failures=True)
+    dynamics, monitor = SecondOrderDynamics(), CaptureMonitor(2.)
+    minimum = math.inf
+    captured = False
+    was_inside = False
+    dt = .05
+    for step in range(1200):
+        obs = {i: LocalObservation(i, p, 0, step * dt) for i, p in positions.items()}
+        result = model(obs, (18, 19, 20), (1,), (), arena, params, dynamics, dt)
+        if monitor.update(step * dt, (1,), (1,), result.inside_cage_evaders):
+            captured = True
+            break
+        decisions = {}
+        for i, v in result.velocities.items():
+            speed = vec_norm(v)
+            if speed < 25:
+                decisions[i] = runtime.CommandDecision("STOP", 0., 0)
+                continue
+            controller = controllers[i]
+            c, score = runtime.choose_calibrated_command(cal, v, 0, controller.last_motion, .5, .08)
+            limits = params.herder_dynamics if i >= 18 else params.evader_dynamics
+            minimum_pwm, maximum_pwm = (90, 170) if i >= 18 else (95, 230)
+            pwm = runtime.speed_to_pwm(speed, limits.max_speed, minimum_pwm, maximum_pwm, 25., 120., 110)
+            if controller.last_pwm in (None, 0):
+                pwm = min(pwm, minimum_pwm)
+            decisions[i] = runtime.rate_limited_motion_decision(controller, c, score, pwm, 240., dt)
+        output = guard(decisions, obs, {i: SimpleNamespace(yaw=0) for i in positions},
+                       {i: cal for i in positions}, arena, params, velocities, (18, 19, 20), step * dt)
+        for i, d in output.items():
+            velocities[i] = (0, 0) if d.command == "STOP" else tuple(v * 120 * d.pwm / 110 for v in directions[d.command])
+            previous = positions[i]
+            positions[i] = tuple(previous[k] + velocities[i][k] * dt for k in (0, 1))
+            controllers[i].last_motion, controllers[i].last_pwm = d.command, d.pwm
+            if d.command == "STOP" and decisions[i].command != "STOP":
+                model.reset(i)
+        # No openings: once inside, the evader must never be outside again.
+        inside_now = arena.contains_cage_local(positions[1])
+        assert not (was_inside and not inside_now), "evader left the cage"
+        was_inside = inside_now
+        # Herders stay outside the cage.
+        assert all(not arena.contains_cage_local(positions[i]) for i in (18, 19, 20))
+        minimum = min(minimum, *(math.dist(positions[i], positions[j])
+                                 for i in positions for j in positions if i < j))
+        assert all(arena.contains_field_local(p, 75) for p in positions.values())
+    assert captured, "membrane cage must capture the evader without any opening"
+    assert minimum >= 230
 
 
 def test_four_metre_150mm_cars_complete_capture_through_virtual_gate():

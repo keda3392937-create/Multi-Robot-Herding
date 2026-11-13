@@ -10,7 +10,8 @@ from dataclasses import replace
 import numpy as np
 from baseline_forces import BaselineForces
 from baseline_virtual_arena import (
-    cage_walls, cage_gate_target, virtual_wall_force, segment_distance,
+    cage_exit_target, cage_gate_target, cage_walls, evader_membrane_force,
+    herder_cage_repulsion, segment_distance, virtual_wall_force,
 )
 from relative_cage_core import (
     ControlParameters, ControlResult, DynamicsLimits, SecondOrderDynamics,
@@ -36,7 +37,8 @@ class BaselineController:
     The source's very large escape acceleration gets a physical acceleration cap.
     """
     def __init__(self, time_scale=1.6, body_gap_mm=80.0,
-                 cage_opening_mm=None, wall_margin_mm=300.0):
+                 cage_opening_mm=None, wall_margin_mm=300.0,
+                 cage_membrane_mm=None, herder_cage_margin_mm=200.0):
         self.model = BaselineForces()
         self.time_scale = time_scale
         self.body_gap_mm = body_gap_mm
@@ -45,6 +47,8 @@ class BaselineController:
         self.dynamics = SecondOrderDynamics()
         self.cage_opening = cage_opening_mm
         self.wall_margin = wall_margin_mm
+        self.cage_membrane = cage_membrane_mm
+        self.herder_cage_margin = herder_cage_margin_mm
 
     def reset(self, marker_id):
         self.dynamics.reset(marker_id)
@@ -94,7 +98,32 @@ class BaselineController:
                 n = vec_norm(a)
                 if n > limits.max_acceleration:
                     a = vec_scale(a, limits.max_acceleration / n)
-                if self.cage_opening is not None:
+                if self.cage_membrane is not None:
+                    # 一向软边界：evader 从任意位置都能被推进笼子，进笼后不能再出来；
+                    # herder 被笼子挡在外面，只能把 evader 往里推。
+                    boundary = field_boundary_force(
+                        positions[i], arena, self.wall_margin + params.robot_radius_mm,
+                        2.0 * limits.max_acceleration,
+                    )
+                    a = vec_add(a, boundary)
+                    if i in e:
+                        a = vec_add(a, evader_membrane_force(
+                            positions[i], arena, self.cage_membrane,
+                            2.0 * limits.max_acceleration,
+                        ))
+                    else:
+                        a = vec_add(a, herder_cage_repulsion(
+                            positions[i], arena, self.herder_cage_margin,
+                            2.0 * limits.max_acceleration, params.robot_radius_mm,
+                        ))
+                        if arena.contains_cage_local(positions[i]):
+                            target = cage_exit_target(positions[i], arena)
+                            a = vec_scale(vec_normalize(vec_sub(target, positions[i])),
+                                          limits.max_acceleration)
+                    n = vec_norm(a)
+                    if n > limits.max_acceleration:
+                        a = vec_scale(a, limits.max_acceleration / n)
+                elif self.cage_opening is not None:
                     # Apply virtual barriers after capping the baseline's huge
                     # escape force, so they can actually redirect a real evader.
                     barrier = virtual_wall_force(
@@ -192,7 +221,7 @@ class PhysicalCommandFilter:
     def __init__(self, gap_mm=80.0, horizon_sec=1.2, reaction_sec=0.25,
                  speed_factor=1.4, jam_timeout_sec=30.0,
                  herder_min_pwm=90, evader_min_pwm=95, isolate_failures=False,
-                 cage_opening_mm=None):
+                 cage_opening_mm=None, cage_membrane_mm=None):
         values = (gap_mm, horizon_sec, reaction_sec, speed_factor, jam_timeout_sec)
         if not all(math.isfinite(v) and v > 0 for v in values):
             raise ValueError("Collision guard settings must be finite and positive")
@@ -209,6 +238,11 @@ class PhysicalCommandFilter:
         self.lost_padding = {}
         self.isolate_failures = isolate_failures
         self.cage_opening = cage_opening_mm
+        self.cage_membrane = cage_membrane_mm
+        self.herder_ids = set()
+        # A herder this close to a wall-trapped evader backs away, otherwise the
+        # evader has no collision-free direction and stays pinned in the corner.
+        self.yield_radius_factor = 3.0
 
     def safe_velocity(self, i, velocity, positions, measured, chosen, arena, radius):
         p = positions[i]
@@ -223,6 +257,11 @@ class PhysicalCommandFilter:
                 if min(segment_distance(p, reaction_end, *wall),
                        segment_distance(reaction_end, end, *wall)) < radius + self.gap / 2:
                     return False
+        if self.cage_membrane is not None and i not in self.herder_ids:
+            # One-way soft boundary: an evader inside the cage may not leave it,
+            # while an evader outside is free to be pushed in anywhere.
+            if arena.contains_cage_local(p) and not arena.contains_cage_local(end):
+                return False
         for j, q in positions.items():
             if j == i:
                 continue
@@ -240,6 +279,7 @@ class PhysicalCommandFilter:
     def __call__(self, decisions, observations, world_poses, calibrations, arena,
                  params, measured, herders, now):
         radius = params.robot_radius_mm
+        self.herder_ids = set(herders)
         positions = {i: o.position for i, o in observations.items()
                      if i in decisions or arena.contains_field_local(o.position, -(radius + self.gap))}
         # An excluded car stays an obstacle. In fault-isolation mode retain its
@@ -296,11 +336,14 @@ class PhysicalCommandFilter:
             if i in herders:
                 if self.cage_opening is not None and arena.contains_cage_local(positions[i]):
                     preferred = vec_normalize(vec_sub(cage_gate_target(positions[i], arena, self.cage_opening), positions[i]))
+                elif self.cage_membrane is not None and arena.contains_cage_local(positions[i]):
+                    preferred = vec_normalize(vec_sub(cage_exit_target(positions[i], arena), positions[i]))
                 for j, p in (() if arena.contains_cage_local(positions[i]) else positions.items()):
                     if j in herders:
                         continue
                     wall = min(p[0], p[1], arena.width_mm - p[0], arena.height_mm - p[1])
-                    if wall < radius + clearance and vec_norm(vec_sub(positions[i], p)) < 2.2 * clearance:
+                    if (wall < radius + clearance
+                            and vec_norm(vec_sub(positions[i], p)) < self.yield_radius_factor * clearance):
                         preferred = vec_normalize(vec_sub(positions[i], p))
                         break
             candidates = []

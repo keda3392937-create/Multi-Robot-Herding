@@ -61,8 +61,13 @@ MAX_SAFE_TCP_IO_TIMEOUT_SEC = 0.20
 # for this many consecutive control cycles stops the whole fleet.
 OVERSPEED_PERSISTENCE_FRAMES = 3
 # Vicon shares the access point with the cars, so a single frame can be a few
-# hundred milliseconds late. Pause that cycle; only a real outage is fatal.
+# hundred milliseconds late. Keep the previous commands for the short cases and
+# pause only when the gap approaches the firmware watchdog.
+MAX_VICON_HOLD_SEC = 0.50
 MAX_VICON_STALL_SEC = 2.0
+# A measured speed this far above the model limit cannot be real motion: the
+# Vicon body is jumping between labels. Exclude that car instead of the fleet.
+TRACKING_FAULT_SPEED_FACTOR = 10.0
 # The firmware writes "PONG id=" and the number in two TCP segments. Wait for a
 # whole line, and only drop a car after several heartbeats in a row are missing.
 PING_RESPONSE_TIMEOUT_SEC = 0.12
@@ -2126,6 +2131,7 @@ def run_control_loop(
     last_pause_reason = ""
     last_overspeed_note = -math.inf
     last_batch_note = -math.inf
+    last_hold_note = -math.inf
     motion_waiting_since: Dict[int, float] = {}
     overspeed_counts: Dict[int, int] = {}
     isolate_failures = getattr(args, "isolate_car_failures", False)
@@ -2177,6 +2183,20 @@ def run_control_loop(
         snapshot = tracker.get_snapshot()
         acquisition_age = time.monotonic() - snapshot.received_at
         if decision_filter is not None and acquisition_age > MAX_SAFE_CONTROL_PERIOD_SEC:
+            if acquisition_age <= MAX_VICON_HOLD_SEC:
+                # Short hiccup: the previous commands were already checked against a
+                # 1.2s prediction horizon and the firmware keeps executing them, so
+                # holding them keeps the fleet moving instead of stopping and
+                # re-accelerating through the motor deadband after every Wi-Fi jitter.
+                if loop_started - last_hold_note >= 1.0:
+                    last_hold_note = loop_started
+                    print(
+                        f"Holding last commands: Vicon frame "
+                        f"{acquisition_age * 1000:.0f}ms late (up to "
+                        f"{MAX_VICON_HOLD_SEC * 1000:.0f}ms)"
+                    )
+                time.sleep(args.control_period)
+                continue
             stop_all(controllers)
             for marker_id in controlled_ids:
                 reset_model(marker_id)
@@ -2319,10 +2339,32 @@ def run_control_loop(
             for marker_id, count in overspeed_counts.items()
             if count >= OVERSPEED_PERSISTENCE_FRAMES
         )
-        if sustained:
+        tracking_faults = []
+        real_overspeed = []
+        for marker_id in sustained:
+            limits = (
+                params.herder_dynamics
+                if marker_id in active_herders
+                else params.evader_dynamics
+            )
+            if suspicious.get(marker_id, 0.0) > TRACKING_FAULT_SPEED_FACTOR * limits.max_speed:
+                tracking_faults.append(marker_id)
+            else:
+                real_overspeed.append(marker_id)
+        if tracking_faults:
+            for marker_id in tracking_faults:
+                overspeed_counts.pop(marker_id, None)
+                exclude_car(
+                    marker_id,
+                    f"Vicon pose jumped {suspicious.get(marker_id, 0.0):.0f}mm/s "
+                    f"(>{TRACKING_FAULT_SPEED_FACTOR:.0f}x the model limit); tracking lost",
+                )
+            require_active_roles()
+            active_ids = tuple(active_herders + active_evaders)
+        if real_overspeed:
             stop_all(controllers)
             details = []
-            for marker_id in sustained:
+            for marker_id in real_overspeed:
                 limits = (
                     params.herder_dynamics
                     if marker_id in active_herders
@@ -2439,10 +2481,14 @@ def run_control_loop(
                 arena, params, measured_velocities, active_herders, loop_started,
             )
             for marker_id, decision in decisions.items():
-                if decision.command == "STOP":
-                    dynamics.reset(marker_id)
-                    if requested_decisions[marker_id].command != "STOP":
-                        reset_model(marker_id)
+                if decision.command == "STOP" and requested_decisions[marker_id].command != "STOP":
+                    # The guard vetoed a motion request, so drop the desired velocity:
+                    # the model must not keep pushing into a blocked direction.
+                    # A STOP that the model itself asked for (speed below the motion
+                    # deadband) must NOT clear it, otherwise the velocity is reset every
+                    # cycle and can never grow past the deadband again -- that deadlock
+                    # left evaders parked in field corners for tens of seconds.
+                    reset_model(marker_id)
 
         for marker_id, decision in decisions.items():
             controller = controllers[marker_id]

@@ -96,9 +96,12 @@ def convex_hull(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, floa
 def cage_segments(width_mm: float, height_mm: float,
                   cage_width_mm: float, cage_height_mm: float,
                   opening_mm: float):
-    """笼子墙段；底边和右边各留一个居中开口，与算法一致。"""
+    """笼子墙段：opening<=0 时是完整的软边界，否则底边/右边各留一个开口。"""
     left, right = 0.0, cage_width_mm
     bottom, top = height_mm - cage_height_mm, height_mm
+    if opening_mm <= 0.0:
+        return (((left, bottom), (left, top)), ((left, top), (right, top)),
+                ((right, top), (right, bottom)), ((right, bottom), (left, bottom)))
     centre_x = (left + right) / 2.0
     centre_y = (bottom + top) / 2.0
     half = opening_mm / 2.0
@@ -147,7 +150,7 @@ def render_run(run_dir: Path = None, *, fps: int = 10, max_frames: int = 240,
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation, PillowWriter
+    import numpy as np
     from matplotlib.patches import Rectangle
 
     run_dir = Path(run_dir) if run_dir is not None else latest_run(log_root)
@@ -158,7 +161,7 @@ def render_run(run_dir: Path = None, *, fps: int = 10, max_frames: int = 240,
     height_mm = float(arena.get("height_mm", 0.0))
     cage_width = float(arena.get("cage_width_mm", 0.0))
     cage_height = float(arena.get("cage_height_mm", 0.0))
-    opening = float(arguments.get("cage_opening_mm", 700.0))
+    opening = float(arguments.get("cage_opening_mm") or 0.0)
     x_axis = tuple(arena.get("x_axis_world") or (1.0, 0.0))
     y_axis = tuple(arena.get("y_axis_world") or (0.0, 1.0))
     if width_mm <= 0 or height_mm <= 0:
@@ -245,12 +248,17 @@ def render_run(run_dir: Path = None, *, fps: int = 10, max_frames: int = 240,
         )
         fig.tight_layout()
 
-    animation = FuncAnimation(fig, draw_frame, frames=len(sampled), interval=1000 // max(fps, 1))
     gif_path = run_dir / "trajectory.gif"
-    animation.save(gif_path, writer=PillowWriter(fps=max(fps, 1)))
-    plt.close(fig)
+    png_path = run_dir / "trajectory.png"
 
+    # 先写轨迹总览：即使动画渲染被 Ctrl+C 打断，也一定有一张图可看。
     # 轨迹总览：所有走过的路径 + 起点/终点
+    for index in range(len(sampled)):
+        elapsed, frame_rows = sampled[index]
+        for car_id, item in _frame_state(frame_rows).items():
+            trail = trails.setdefault(car_id, [])
+            if not trail or math.dist(trail[-1], (item["x"], item["y"])) > 1.0:
+                trail.append((item["x"], item["y"]))
     fig2, ax2 = plt.subplots(figsize=(8.0, 8.0 * height_mm / max(width_mm, 1.0)), dpi=110)
     ax2.set_xlim(-150, width_mm + 150)
     ax2.set_ylim(-150, height_mm + 150)
@@ -264,11 +272,11 @@ def render_run(run_dir: Path = None, *, fps: int = 10, max_frames: int = 240,
     for start, end in segments:
         ax2.plot([start[0], end[0]], [start[1], end[1]], color=CAGE_EDGE,
                  linewidth=2.4, zorder=2)
+    last_frame_state = _frame_state(sampled[-1][1])
     for car_id, trail in trails.items():
         if len(trail) < 2:
             continue
         first, last = trail[0], trail[-1]
-        last_frame_state = _frame_state(sampled[-1][1])
         role = last_frame_state.get(car_id, {}).get("role", "evader")
         color = HARDER_COLOR if role == "herder" else EVADER_COLOR
         ax2.plot([p[0] for p in trail], [p[1] for p in trail],
@@ -281,9 +289,44 @@ def render_run(run_dir: Path = None, *, fps: int = 10, max_frames: int = 240,
                      textcoords="offset points", fontsize=7, color=color)
     ax2.set_title(f"{run_dir.name}: start (o) and end (X) of every car", fontsize=11)
     fig2.tight_layout()
-    png_path = run_dir / "trajectory.png"
     fig2.savefig(png_path)
     plt.close(fig2)
+
+    # 再逐帧渲染动画。自己收集帧，Ctrl+C 时可以保存已经渲染的部分。
+    from PIL import Image
+    trails.clear()
+    frames_rgb: List[Image.Image] = []
+    palette_reference = None
+    try:
+        for index in range(len(sampled)):
+            draw_frame(index)
+            fig.canvas.draw()
+            buffer = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+            image = Image.fromarray(buffer)
+            if palette_reference is None:
+                palette_reference = image.quantize(colors=96, method=Image.Quantize.MEDIANCUT)
+                frames_rgb.append(palette_reference)
+            else:
+                frames_rgb.append(image.quantize(
+                    palette=palette_reference, dither=Image.Dither.NONE))
+            if (index + 1) % 25 == 0:
+                print(f"  GIF frame {index + 1}/{len(sampled)}")
+    except KeyboardInterrupt:
+        print(f"  GIF rendering interrupted after {len(frames_rgb)}/{len(sampled)} frames; "
+              "saving a shorter animation")
+    finally:
+        plt.close(fig)
+    if frames_rgb:
+        temporary = gif_path.with_suffix(".tmp.gif")
+        try:
+            frames_rgb[0].save(
+                temporary, save_all=True, append_images=frames_rgb[1:],
+                duration=int(1000 / max(fps, 1)), loop=0, optimize=False,
+            )
+            temporary.replace(gif_path)
+        except KeyboardInterrupt:
+            temporary.unlink(missing_ok=True)
+            print("  GIF saving interrupted; the overview image is still available")
     return {"gif": gif_path, "png": png_path}
 
 

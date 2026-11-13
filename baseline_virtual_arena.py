@@ -14,7 +14,7 @@ from statistics import median
 
 from relative_cage_core import (
     ArenaGeometryError, FieldCorners, RelativeArena,
-    vec_add, vec_scale, vec_sub, vec_dot, vec_norm,
+    vec_add, vec_scale, vec_sub, vec_dot, vec_norm, vec_normalize,
 )
 
 
@@ -50,6 +50,73 @@ def cage_walls(arena, opening_mm):
     return (((l, b), (l, t)), ((l, t), (r, t)),
             ((l, b), (cx - half, b)), ((cx + half, b), (r, b)),
             ((r, b), (r, cy - half)), ((r, cy + half), (r, t)))
+
+
+def cage_outline(arena):
+    """The cage rectangle as four closed walls (no openings)."""
+    l, r, b, t = arena.cage_left, arena.cage_right, arena.cage_bottom, arena.cage_top
+    return (((l, b), (l, t)), ((l, t), (r, t)), ((r, t), (r, b)), ((r, b), (l, b)))
+
+
+def cage_exit_target(point, arena, offset_mm=60.0):
+    """Nearest point just outside the cage, through the walls facing the field.
+
+    The cage sits in a field corner, so its left and top walls are the field
+    boundary itself; the only sensible way out is across the bottom or the
+    right wall.
+    """
+    x_mm, y_mm = point
+    to_bottom = abs(y_mm - arena.cage_bottom)
+    to_right = abs(arena.cage_right - x_mm)
+    if to_bottom <= to_right:
+        return (x_mm, arena.cage_bottom - offset_mm)
+    return (arena.cage_right + offset_mm, y_mm)
+
+
+def herder_cage_repulsion(point, arena, margin_mm, weight, body_radius_mm):
+    """Keep herders out of the cage; inside, push them back across the nearest wall."""
+    if margin_mm <= 0.0 or weight <= 0.0:
+        return (0.0, 0.0)
+    x_mm, y_mm = point
+    if arena.contains_cage_local(point):
+        to_bottom = max(0.0, y_mm - arena.cage_bottom)
+        to_right = max(0.0, arena.cage_right - x_mm)
+        if to_bottom <= to_right:
+            return (0.0, -weight * min(3.0, 1.0 + to_bottom / margin_mm))
+        return (weight * min(3.0, 1.0 + to_right / margin_mm), 0.0)
+
+    closest = (
+        min(max(x_mm, arena.cage_left), arena.cage_right),
+        min(max(y_mm, arena.cage_bottom), arena.cage_top),
+    )
+    offset = vec_sub(point, closest)
+    distance = vec_norm(offset)
+    gap = max(0.0, distance - body_radius_mm)
+    if gap >= margin_mm or distance <= 1e-9:
+        return (0.0, 0.0)
+    closeness = 1.0 - gap / margin_mm
+    return vec_scale(vec_normalize(offset), weight * closeness * closeness)
+
+
+def evader_membrane_force(point, arena, margin_mm, weight):
+    """One-way soft boundary: evaders inside the cage are pushed back to its centre.
+
+    Outside the cage nothing is applied, so herders can push an evader across
+    the boundary anywhere; once inside, the membrane keeps it there.
+    """
+    if margin_mm <= 0.0 or weight <= 0.0 or not arena.contains_cage_local(point):
+        return (0.0, 0.0)
+    x_mm, y_mm = point
+    total = (0.0, 0.0)
+    for distance, inward in (
+        (y_mm - arena.cage_bottom, (0.0, 1.0)),
+        (arena.cage_right - x_mm, (-1.0, 0.0)),
+    ):
+        if distance >= margin_mm:
+            continue
+        closeness = 1.0 - max(distance, 0.0) / margin_mm
+        total = vec_add(total, vec_scale(inward, weight * closeness * closeness))
+    return total
 
 
 def cage_gate_target(point, arena, opening_mm):
@@ -310,14 +377,15 @@ def fixed_arena(field_corners_world, cage_corners_world, opening_mm,
                 "cage edges are not parallel to the field edges "
                 f"(corner off by {nearest:.0f}mm); check CAGE_CORNERS_WORLD"
             )
-    if not (math.isfinite(opening_mm) and 0.0 < opening_mm < min(cage_width, cage_height)):
-        raise ArenaGeometryError(
-            "cage opening must be positive and smaller than both cage dimensions"
-        )
-    if opening_mm <= robot_diameter_mm + gap_mm:
-        raise ArenaGeometryError(
-            "cage opening must exceed the car diameter plus the body gap"
-        )
+    if opening_mm is not None:
+        if not (math.isfinite(opening_mm) and 0.0 < opening_mm < min(cage_width, cage_height)):
+            raise ArenaGeometryError(
+                "cage opening must be positive and smaller than both cage dimensions"
+            )
+        if opening_mm <= robot_diameter_mm + gap_mm:
+            raise ArenaGeometryError(
+                "cage opening must exceed the car diameter plus the body gap"
+            )
 
     arena = RelativeArena(
         origin_world=origin,
@@ -372,7 +440,7 @@ class FixedCornerArena:
     the cars, so the field stays identical between runs.
     """
 
-    def __init__(self, field_corners_world, cage_corners_world, opening_mm,
+    def __init__(self, field_corners_world, cage_corners_world, opening_mm=None,
                  robot_diameter_mm=150.0, gap_mm=80.0, minimum_clearance_mm=300.0):
         self.opening = opening_mm
         self.robot_radius = 0.5 * robot_diameter_mm
@@ -394,11 +462,19 @@ class FixedCornerArena:
             f"x axis=({arena.x_axis_world[0]:+.3f},{arena.x_axis_world[1]:+.3f}), "
             f"y axis=({arena.y_axis_world[0]:+.3f},{arena.y_axis_world[1]:+.3f})"
         )
-        print(
-            f"Fixed cage: {arena.cage_width_mm:.0f}x{arena.cage_height_mm:.0f}mm "
-            f"in the field corner at local (0,{arena.height_mm:.0f}); "
-            f"{self.opening:.0f}mm openings on its bottom and right walls"
-        )
+        if self.opening:
+            print(
+                f"Fixed cage: {arena.cage_width_mm:.0f}x{arena.cage_height_mm:.0f}mm "
+                f"in the field corner at local (0,{arena.height_mm:.0f}); "
+                f"{self.opening:.0f}mm openings on its bottom and right walls"
+            )
+        else:
+            print(
+                f"Fixed cage: {arena.cage_width_mm:.0f}x{arena.cage_height_mm:.0f}mm "
+                f"in the field corner at local (0,{arena.height_mm:.0f}); "
+                "one-way soft boundary (evaders can be pushed in, cannot leave; "
+                "herders stay out)"
+            )
         cage_corners_world = {
             "left-up": arena.local_to_world(arena.cage_top_left_local),
             "right-down": arena.local_to_world(arena.cage_right_down_local),

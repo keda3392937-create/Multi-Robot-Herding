@@ -35,8 +35,8 @@ VICON_SERVER = VICON_HOST                # 默认 192.168.33.103
 # ====================== 【需要改】场地与笼子坐标 ======================
 # 单位 mm，直接填 Tracker 里读到的 Vicon 世界坐标（X 向右、Y 向上）。
 # 四个点的顺序随意，脚本会自己判断矩形和笼子贴着场地的哪个角。
-# 笼子必须紧贴场地的一个角，它会成为局部坐标的“左上角”，
-# 两个开口（CAGE_OPENING_MM）自动开在朝向场地内部的两条边上。
+# 笼子必须紧贴场地的一个角，它会成为局部坐标的“左上角”；
+# 笼子边界是一向软边界：evader 能被推进去、进去后出不来，herder 不进入。
 FIELD_CORNERS_WORLD = (
     (7180.0, 3880.0),
     (-150.0, -2670.0),
@@ -56,8 +56,11 @@ USE_FIXED_ARENA = True
 # 车体与笼子
 ROBOT_DIAMETER_MM = 150.0                # 三角底盘最大外径
 BODY_GAP_MM = 80.0                       # 额外车距，最小中心距 = 直径 + 该值
-CAGE_OPENING_MM = 700.0                  # 笼子两条边中央的开口宽度
-WALL_REPULSION_MARGIN_MM = 300.0         # 虚拟墙斥力作用范围
+# 笼子是一向软边界（没有开口）：evader 从任意位置都能被推进去，进去后不会出来；
+# herder 永远在笼子外面，只负责把 evader 往里推。
+CAGE_MEMBRANE_MM = 250.0                 # 笼内一向软边界的厚度
+CAGE_HERDER_MARGIN_MM = 200.0            # herder 被笼子挡开的距离
+WALL_REPULSION_MARGIN_MM = 300.0         # 场地虚拟墙斥力作用范围
 MIN_START_CLEARANCE_MM = 300.0           # 建议初始车位距场地边界的最小距离
 
 # 自动模式（USE_FIXED_ARENA=False）才会用到
@@ -108,7 +111,7 @@ RECALIBRATE_EVERY_RUN = True
 # 运行结束后自动把这次实验画成 GIF/轨迹图（需要 matplotlib，失败不影响实验）
 MAKE_RUN_ANIMATION = True
 ANIMATION_FPS = 10
-ANIMATION_MAX_FRAMES = 240
+ANIMATION_MAX_FRAMES = 180
 
 SKIP_WIFI_SETUP = True                   # 电脑已经连好 YAYA
 CAR_IP_OVERRIDES = ()                    # 可选：("3=192.168.33.115",)
@@ -131,7 +134,7 @@ def parse_args(argv=None):
         "isolate_car_failures": IGNORE_FAILED_CARS,
         "field_mode": "fixed_corners" if USE_FIXED_ARENA else "initial_car_positions",
         "field_width_mm": FIELD_WIDTH_MM, "field_height_mm": FIELD_HEIGHT_MM,
-        "cage_opening_mm": CAGE_OPENING_MM,
+        "cage_opening_mm": 0.0,  # 软边界模型没有开口，只用于日志/回放
         "recalibrate": RECALIBRATE_EVERY_RUN,
         "calibration_speed": CALIBRATION_SPEED,
         "calibration_move_sec": CALIBRATION_MOVE_SEC,
@@ -320,12 +323,12 @@ def calibrate_like_twelve_car(
 def build_arena_initializer():
     if USE_FIXED_ARENA:
         return FixedCornerArena(
-            FIELD_CORNERS_WORLD, CAGE_CORNERS_WORLD, CAGE_OPENING_MM,
+            FIELD_CORNERS_WORLD, CAGE_CORNERS_WORLD, None,
             ROBOT_DIAMETER_MM, BODY_GAP_MM, MIN_START_CLEARANCE_MM,
         )
     return InitialCarArena(
         FIELD_WIDTH_MM, FIELD_HEIGHT_MM, BODY_GAP_MM,
-        CAGE_OPENING_MM, INITIAL_FIELD_INSET_MM,
+        700.0, INITIAL_FIELD_INSET_MM,
     )
 
 
@@ -375,14 +378,16 @@ def main(argv=None):
             arena_initializer.arena, len(runtime.parse_id_spec(args.evaders)),
         )
 
-    model = BaselineController(SIMULATION_TIME_SCALE, BODY_GAP_MM,
-                               CAGE_OPENING_MM, WALL_REPULSION_MARGIN_MM)
+    model = BaselineController(
+        SIMULATION_TIME_SCALE, BODY_GAP_MM, None, WALL_REPULSION_MARGIN_MM,
+        cage_membrane_mm=CAGE_MEMBRANE_MM, herder_cage_margin_mm=CAGE_HERDER_MARGIN_MM,
+    )
     guard = PhysicalCommandFilter(
         BODY_GAP_MM, PREDICTION_HORIZON_SEC, REACTION_TIME_SEC,
         SPEED_UNCERTAINTY_FACTOR, JAM_TIMEOUT_SEC,
         herder_min_pwm=args.herder_min_pwm, evader_min_pwm=args.evader_min_pwm,
         isolate_failures=IGNORE_FAILED_CARS,
-        cage_opening_mm=CAGE_OPENING_MM,
+        cage_membrane_mm=CAGE_MEMBRANE_MM,
     )
 
     def parameters(arena, radius):
@@ -415,6 +420,9 @@ def render_run_animation(args) -> None:
         import animate_herding_run
         paths = animate_herding_run.render_run(run_dir, fps=ANIMATION_FPS,
                                                max_frames=ANIMATION_MAX_FRAMES)
+    except KeyboardInterrupt:
+        print("Trajectory animation interrupted; run animate_herding_run.py to redraw it.")
+        return
     except Exception as exc:  # 画图只是附加功能，绝不能因此影响实验结果
         print(f"Trajectory animation skipped: {type(exc).__name__}: {exc}")
         return
