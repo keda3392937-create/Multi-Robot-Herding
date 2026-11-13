@@ -60,6 +60,12 @@ MAX_SAFE_TCP_IO_TIMEOUT_SEC = 0.20
 # buffered frame next to a current one. Only a speed that stays above the limit
 # for this many consecutive control cycles stops the whole fleet.
 OVERSPEED_PERSISTENCE_FRAMES = 3
+# Vicon shares the access point with the cars, so a single frame can be a few
+# hundred milliseconds late. Pause that cycle; only a real outage is fatal.
+MAX_VICON_STALL_SEC = 2.0
+# One slow PONG must not drop a healthy car for the whole experiment.
+PING_ATTEMPTS = 3
+PING_RETRY_DELAY_SEC = 0.05
 
 
 @dataclass(frozen=True)
@@ -298,37 +304,61 @@ class ExperimentCarController:
         return True
 
     def ping(self) -> bool:
-        if not self._send_line("PING") or self.sock is None:
-            return False
-        try:
-            response = bytearray()
-            while len(response) < 64:
-                chunk = self.sock.recv(64 - len(response))
-                if not chunk:
-                    raise ConnectionError("TCP peer closed during PING")
-                response.extend(chunk)
-                if b"\n" in response:
-                    break
-            line = bytes(response).splitlines()[0].strip().upper()
-            if line == b"PONG" and self.allow_plain_pong:
-                pass
-            elif line.startswith(b"PONG ID="):
-                try:
-                    response_id = int(line.removeprefix(b"PONG ID="))
-                except ValueError as exc:
-                    raise ConnectionError(f"invalid PING identity response: {line!r}") from exc
-                if response_id != self.marker_id:
-                    raise ConnectionError(
-                        f"PING identity mismatch: expected car{self.marker_id}, received car{response_id}"
-                    )
-            else:
-                raise ConnectionError(f"unexpected PING response: {line!r}")
-            self.last_ping_at = time.monotonic()
-            return True
-        except OSError as exc:
-            self.failure_reason = f"TCP PING failed: {exc}"
-        except ConnectionError as exc:
-            self.failure_reason = str(exc)
+        """Ask the car for its identity; retries transient Wi-Fi timeouts.
+
+        With a whole fleet on one access point a single PONG can arrive a few
+        milliseconds late. Dropping the car for the rest of the run because of
+        one slow reply is far worse than asking again, so only a wrong identity
+        or a closed socket fails immediately.
+        """
+        last_reason = "TCP PING failed"
+        for attempt in range(PING_ATTEMPTS):
+            if attempt:
+                time.sleep(PING_RETRY_DELAY_SEC)
+            if self.sock is None or not self.active:
+                return False
+            try:
+                if not self._send_line("PING") or self.sock is None:
+                    return False
+                response = bytearray()
+                while len(response) < 64:
+                    chunk = self.sock.recv(64 - len(response))
+                    if not chunk:
+                        raise ConnectionError("TCP peer closed during PING")
+                    response.extend(chunk)
+                    if b"\n" in response:
+                        break
+                line = bytes(response).splitlines()[0].strip().upper()
+                if line == b"PONG" and self.allow_plain_pong:
+                    pass
+                elif line.startswith(b"PONG ID="):
+                    try:
+                        response_id = int(line.removeprefix(b"PONG ID="))
+                    except ValueError as exc:
+                        raise ConnectionError(f"invalid PING identity response: {line!r}") from exc
+                    if response_id != self.marker_id:
+                        raise ConnectionError(
+                            f"PING identity mismatch: expected car{self.marker_id}, "
+                            f"received car{response_id}"
+                        )
+                else:
+                    raise ConnectionError(f"unexpected PING response: {line!r}")
+                self.last_ping_at = time.monotonic()
+                self.failure_reason = ""
+                return True
+            except TimeoutError:
+                last_reason = f"TCP PING timed out ({attempt + 1}/{PING_ATTEMPTS})"
+                self.failure_reason = last_reason
+                continue
+            except OSError as exc:
+                self.failure_reason = f"TCP PING failed: {exc}"
+                self.close(send_stop=False)
+                return False
+            except ConnectionError as exc:
+                self.failure_reason = str(exc)
+                self.close(send_stop=False)
+                return False
+        self.failure_reason = last_reason
         self.close(send_stop=False)
         return False
 
@@ -2083,6 +2113,7 @@ def run_control_loop(
     last_status_at = 0.0
     last_pause_reason = ""
     last_overspeed_note = -math.inf
+    last_batch_note = -math.inf
     motion_waiting_since: Dict[int, float] = {}
     overspeed_counts: Dict[int, int] = {}
     isolate_failures = getattr(args, "isolate_car_failures", False)
@@ -2132,9 +2163,32 @@ def run_control_loop(
         dt = clamp_value(loop_started - previous_loop_at, 0.01, 0.25)
         previous_loop_at = loop_started
         snapshot = tracker.get_snapshot()
-
-        if decision_filter is not None and time.monotonic() - snapshot.received_at > MAX_SAFE_CONTROL_PERIOD_SEC:
-            raise SafetyStop("Vicon frame acquisition exceeded collision prediction timing budget")
+        acquisition_age = time.monotonic() - snapshot.received_at
+        if decision_filter is not None and acquisition_age > MAX_SAFE_CONTROL_PERIOD_SEC:
+            stop_all(controllers)
+            for marker_id in controlled_ids:
+                reset_model(marker_id)
+            velocity_estimator.reset_many(controlled_ids)
+            capture_monitor.reset()
+            motion_waiting_since.clear()
+            overspeed_counts.clear()
+            if acquisition_age > MAX_VICON_STALL_SEC:
+                raise SafetyStop(
+                    f"Vicon stopped delivering frames for {acquisition_age:.2f}s"
+                )
+            pause_reason = "Vicon frame slower than the collision timing budget"
+            if pause_reason != last_pause_reason:
+                print(
+                    f"Paused: {pause_reason} (latest frame took "
+                    f"{acquisition_age * 1000:.0f}ms; resumes when data is fresh)"
+                )
+                logger.event(
+                    "control_paused",
+                    f"{pause_reason}; {acquisition_age * 1000:.0f}ms",
+                )
+                last_pause_reason = pause_reason
+            time.sleep(args.control_period)
+            continue
 
         corners_ok, corner_reason = check_corner_reference(
             snapshot,
@@ -2381,8 +2435,15 @@ def run_control_loop(
         for marker_id, decision in decisions.items():
             controller = controllers[marker_id]
             if decision_filter is not None and time.monotonic() - loop_started > MAX_SAFE_CONTROL_PERIOD_SEC:
+                # Sending this batch now would act on stale poses; stop instead of
+                # aborting the run, and retry from a fresh frame next cycle.
                 stop_all(controllers)
-                raise SafetyStop("Control batch too old; refusing to send stale motion")
+                if loop_started - last_batch_note >= 1.0:
+                    last_batch_note = loop_started
+                    print("Paused: command batch took longer than the control budget; "
+                          "all cars stopped for this cycle")
+                    logger.event("control_paused", "command batch slower than budget")
+                break
             if not controller.set_motion(
                 decision.command,
                 decision.pwm,

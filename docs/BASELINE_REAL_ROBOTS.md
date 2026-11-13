@@ -126,6 +126,23 @@ Vicon 获取或一批指令耗时超过 0.2 秒时停车结束，避免发送过
 
 如果整组仍然被停，说明是持续性的数据问题（比如场地被遮挡、刚体命名不对），需要检查 Tracker。
 
+## 单帧延迟、PING 超时与自动暂停
+
+Vicon 主机和 24 辆小车共用同一个 Wi-Fi，个别帧被推迟几百毫秒是正常的。旧版本对
+“取一帧超过 0.2 秒”直接结束实验（`Vicon frame acquisition exceeded collision prediction
+timing budget`），一次网络抖动就会让跑到一半的围捕停掉。现在改为：
+
+- 取帧超过 0.2 秒：**暂停一个控制周期**，全部车辆停车、清空速度状态，下一帧正常后自动
+  `Control resumed` 继续。日志里会出现
+  `Paused: Vicon frame slower than the collision timing budget (latest frame took 312ms; ...)`。
+- 超过 2 秒仍没有帧：才判定为真正中断并结束（`Vicon stopped delivering frames for 3.05s`）。
+- 指令批次因为网络慢超过 0.2 秒：停一次车、下一周期重来，不再直接结束实验。
+
+心跳 `PING` 也一样：Wi-Fi 拥塞时 80 ms 内收不到 `PONG` 很常见。现在每辆车最多重试 3 次
+（间隔 50 ms），仍失败才剔除；只有**身份不符**（`PONG id=` 与期望编号不同）会立即剔除，
+不会重试。这也解释了之前的 `Ignoring car21: TCP PING failed: timed out`：车本身是好的，
+只是回复慢了一点点——单独跑 `random_car1_vicon_test.py` 时没有 24 辆车的竞争，所以看不出问题。
+
 ## 笼子容量提醒
 
 `cage_has_capacity` 用的是 1.3×车体直径的估算，比较宽松。入口会另外按碰撞过滤真正要求的

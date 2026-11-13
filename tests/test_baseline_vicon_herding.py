@@ -550,6 +550,183 @@ def test_cage_packing_warning_flags_a_cage_too_small_for_the_evaders(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_ping_retries_a_single_wifi_timeout():
+    import relative_cage_capture as runtime
+    class FlakySocket:
+        def __init__(self):
+            self.replies = [TimeoutError("timed out"), b"PONG id=7\n"]
+            self.sent = []
+        def sendall(self, data):
+            self.sent.append(data)
+        def recv(self, _count):
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        def close(self):
+            pass
+    controller = runtime.ExperimentCarController(7, "192.168.33.111", 0.6, 0.08)
+    controller.sock = FlakySocket()
+    controller.active = True
+    assert controller.ping()
+    assert controller.failure_reason == ""
+    assert controller.last_ping_at > 0
+    assert controller.sock.sent.count(b"PING\n") == 2
+
+
+def test_ping_does_not_retry_a_wrong_identity():
+    import relative_cage_capture as runtime
+    class WrongCarSocket:
+        def __init__(self):
+            self.reads = 0
+        def sendall(self, _data):
+            pass
+        def recv(self, _count):
+            self.reads += 1
+            return b"PONG id=8\n"
+        def close(self):
+            pass
+    controller = runtime.ExperimentCarController(7, "192.168.33.111", 0.6, 0.08)
+    sock = WrongCarSocket()
+    controller.sock = sock
+    controller.active = True
+    assert not controller.ping()
+    assert "identity mismatch" in controller.failure_reason
+    assert sock.reads == 1
+
+
+def test_slow_vicon_frame_pauses_instead_of_aborting(arena, monkeypatch, capsys):
+    """Vicon shares the access point with the cars; a 0.3 s frame must not end the run."""
+    import relative_cage_capture as runtime
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(runtime.time, "sleep",
+                        lambda seconds: setattr(clock, "now", clock.now + max(seconds, 0.01)))
+    monkeypatch.setattr(runtime, "drain_vicon_frames", lambda *_: None)
+    ids = (1, 2, 3, 9)
+    obs = {i: observation(i, 700 + 650 * k, 1000) for k, i in enumerate(ids)}
+    snapshots = SimpleNamespace(count=0)
+
+    class Tracker:
+        def get_snapshot(self):
+            snapshots.count += 1
+            clock.now += 0.005
+            # The second frame arrives 0.3 s old: above the 0.2 s budget.
+            age = 0.3 if snapshots.count == 2 else 0.005
+            return SimpleNamespace(received_at=clock.now - age, frame_number=snapshots.count)
+
+    class Estimator:
+        def __init__(self, *_):
+            self.raw_this_update = {}
+        def update(self, *_args):
+            self.raw_this_update = {}
+            return {}
+        def reset(self, *_):
+            pass
+        def reset_many(self, *_):
+            pass
+
+    class Controller:
+        def __init__(self):
+            self.active, self.last_pwm, self.last_motion = True, 0, ""
+            self.pwm_slew_credit, self.failure_reason = 0.0, ""
+            self.last_ping_at = 0.0
+        def set_motion(self, *_args, **_kwargs):
+            return True
+        def send_stop(self, force=False):
+            return True
+        def close(self, send_stop=True):
+            self.active = False
+        def ping(self):
+            return True
+
+    def current(*_args):
+        return obs, {i: SimpleNamespace(position=o.position, yaw=0.0) for i, o in obs.items()}
+
+    def model(observations, herders, evaders, *_args, **_kwargs):
+        return SimpleNamespace(
+            velocities={i: (0.0, 0.0) for i in herders + evaders},
+            visible_herders=tuple(herders), visible_evaders=tuple(evaders),
+            inside_cage_evaders=(), herder_hull_ids=tuple(herders),
+            augmented_hull_herder_ids=tuple(herders), contained_evaders=(),
+        )
+    model.reset = lambda *_: None
+
+    monkeypatch.setattr(runtime, "check_corner_reference", lambda *_: (True, ""))
+    monkeypatch.setattr(runtime, "current_local_observations", current)
+    monkeypatch.setattr(runtime, "ViconVelocityEstimator", Estimator)
+    monkeypatch.setattr(runtime, "log_control_states", lambda *_: None)
+    args = runtime.parse_args([], defaults={"isolate_car_failures": True, "max_runtime_sec": 0.30})
+    runtime.run_control_loop(
+        args, Tracker(), {i: f"kedaya{i}" for i in ids}, {}, {},
+        arena, physical_parameters(arena, 150), (1, 2, 3), (9,),
+        (1, 2, 3), (9,), {i: Controller() for i in ids},
+        {i: calibration() for i in ids}, set(), SimpleNamespace(event=lambda *_: None),
+        control_step=model, decision_filter=lambda decisions, *_: decisions,
+    )
+    assert snapshots.count >= 3
+    assert "Paused: Vicon frame slower than the collision timing budget" in capsys.readouterr().out
+
+
+def test_vicon_outage_still_stops_the_fleet(arena, monkeypatch):
+    import relative_cage_capture as runtime
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(runtime.time, "sleep",
+                        lambda seconds: setattr(clock, "now", clock.now + max(seconds, 0.01)))
+    monkeypatch.setattr(runtime, "drain_vicon_frames", lambda *_: None)
+    ids = (1, 2, 3, 9)
+    obs = {i: observation(i, 700 + 650 * k, 1000) for k, i in enumerate(ids)}
+
+    class Tracker:
+        def get_snapshot(self):
+            clock.now += 0.005
+            return SimpleNamespace(received_at=clock.now - 3.0, frame_number=1)
+
+    class Estimator:
+        def __init__(self, *_):
+            self.raw_this_update = {}
+        def update(self, *_args):
+            self.raw_this_update = {}
+            return {}
+        def reset(self, *_):
+            pass
+        def reset_many(self, *_):
+            pass
+
+    class Controller:
+        def __init__(self):
+            self.active, self.last_pwm, self.last_motion = True, 0, ""
+            self.pwm_slew_credit, self.failure_reason = 0.0, ""
+            self.last_ping_at = 0.0
+        def set_motion(self, *_args, **_kwargs):
+            return True
+        def send_stop(self, force=False):
+            return True
+        def close(self, send_stop=True):
+            self.active = False
+        def ping(self):
+            return True
+
+    def current(*_args):
+        return obs, {i: SimpleNamespace(position=o.position, yaw=0.0) for i, o in obs.items()}
+
+    monkeypatch.setattr(runtime, "check_corner_reference", lambda *_: (True, ""))
+    monkeypatch.setattr(runtime, "current_local_observations", current)
+    monkeypatch.setattr(runtime, "ViconVelocityEstimator", Estimator)
+    monkeypatch.setattr(runtime, "log_control_states", lambda *_: None)
+    args = runtime.parse_args([], defaults={"isolate_car_failures": True, "max_runtime_sec": 1.0})
+    with pytest.raises(runtime.SafetyStop, match="stopped delivering frames"):
+        runtime.run_control_loop(
+            args, Tracker(), {i: f"kedaya{i}" for i in ids}, {}, {},
+            arena, physical_parameters(arena, 150), (1, 2, 3), (9,),
+            (1, 2, 3), (9,), {i: Controller() for i in ids},
+            {i: calibration() for i in ids}, set(), SimpleNamespace(event=lambda *_: None),
+            control_step=lambda *a, **k: pytest.fail("must not compute on stale data"),
+            decision_filter=lambda decisions, *_: decisions,
+        )
+
+
 def test_measured_zero_does_not_erase_startup_acceleration(arena):
     params = physical_parameters(arena, 150)
     model, measured_state = BaselineController(), SecondOrderDynamics()
